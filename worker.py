@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 import serial
 import serial.tools.list_ports
@@ -17,6 +17,7 @@ from cyclograms import START_CYCLE, COOLING_CYCLE
 
 
 class ControllerWorker(QObject):
+    # data to UI
     sample = pyqtSignal(object)   # dict
     status = pyqtSignal(object)   # dict
     error = pyqtSignal(str)
@@ -28,92 +29,53 @@ class ControllerWorker(QObject):
         self.dt = float(dt)
         self._timer = QTimer(self)
         self._timer.setInterval(max(10, int(self.dt * 1000)))
-        self._timer.timeout.connect(self._on_tick)
+        self._timer.timeout.connect(self._tick)
 
-        self._polling = False
         self._t0 = time.time()
         self.stage = "idle"
 
-        # devices
-        self.pump = VESCDevice()
-        self.starter = VESCDevice()
+        # devices (I/O must happen ONLY in this thread)
+        self.pump = VESCDevice(timeout=0.01)
+        self.starter = VESCDevice(timeout=0.01)
         self.psu = RidenPSU()
 
         self.pole_pairs_pump = 3
         self.pole_pairs_starter = 3
 
-        # targets (continuous send like visualVESC)
+        # continuous targets (keep-alive like VESC watchdog)
         self.pump_target = {"mode": "duty", "value": 0.0}
         self.starter_target = {"mode": "duty", "value": 0.0}
-
         self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-        self._psu_cmd_dirty = False
-        self._psu_last_read: Dict[str, Any] = {}
-        self._psu_next_read_t = 0.0
-        self._psu_next_cmd_t = 0.0
+        self._psu_dirty = False
+
+        # last values (to keep plot stable even if a read missed)
+        self._last_pump = VESCValues()
+        self._last_starter = VESCValues()
+        self._last_psu: Dict[str, Any] = {}
+
+        # rate limiting PSU
+        self._psu_next_read = 0.0
+        self._psu_next_cmd = 0.0
 
         # cyclogram
         self.cycle_active = False
         self.cycle: List = []
         self.cycle_idx = 0
-        self._step_deadline = 0.0
+        self._step_end_t = 0.0
 
         # logger
         self.logger = CSVLogger()
         self.logging_on = False
         self._next_flush_t = 0.0
 
-        # last values
-        self._last_pump = VESCValues()
-        self._last_starter = VESCValues()
+        self._in_tick = False
 
-    # ---------- util
+    # -------- ports (safe to call from UI thread too)
     @staticmethod
-    def list_ports() -> List[str]:
+    def list_ports() -> list[str]:
         return [p.device for p in serial.tools.list_ports.comports()]
 
-    def _emit_connected(self) -> None:
-        self.status.emit({
-            "connected": {
-                "pump": self.pump.is_connected,
-                "starter": self.starter.is_connected,
-                "psu": self.psu.is_connected,
-            },
-            "stage": self.stage,
-            "log_path": self.logger.path,
-        })
-
-    def _safe_disconnect_pump(self, reason: str = ""):
-        try:
-            self.pump.disconnect()
-        except Exception:
-            pass
-        self._last_pump = VESCValues()
-        if reason:
-            self.error.emit(f"Pump disconnected: {reason}")
-        self._emit_connected()
-
-    def _safe_disconnect_starter(self, reason: str = ""):
-        try:
-            self.starter.disconnect()
-        except Exception:
-            pass
-        self._last_starter = VESCValues()
-        if reason:
-            self.error.emit(f"Starter disconnected: {reason}")
-        self._emit_connected()
-
-    def _safe_disconnect_psu(self, reason: str = ""):
-        try:
-            self.psu.disconnect()
-        except Exception:
-            pass
-        self._psu_last_read = {}
-        if reason:
-            self.error.emit(f"PSU disconnected: {reason}")
-        self._emit_connected()
-
-    # ---------- lifecycle (called in worker thread)
+    # -------- lifecycle (called by UI when thread starts / on close)
     @pyqtSlot()
     def start(self) -> None:
         self._t0 = time.time()
@@ -123,7 +85,7 @@ class ControllerWorker(QObject):
 
     @pyqtSlot()
     def stop(self) -> None:
-        # stop timer first
+        # stop polling first
         try:
             self._timer.stop()
         except Exception:
@@ -149,24 +111,25 @@ class ControllerWorker(QObject):
         except Exception:
             pass
 
-        # disconnect all
-        self._safe_disconnect_pump()
-        self._safe_disconnect_starter()
-        self._safe_disconnect_psu()
+        # disconnect
+        self._disconnect_pump()
+        self._disconnect_starter()
+        self._disconnect_psu()
 
-        # close logger
+        # logger
         try:
             self.logger.stop()
         except Exception:
             pass
         self.logging_on = False
 
-    # ---------- commands from UI
+        self._emit_connected()
+
+    # -------- UI commands (SLOTS)
     @pyqtSlot(str)
     def cmd_ready(self, prefix: str) -> None:
         self._t0 = time.time()
         self.stage = "ready"
-
         self.cycle_active = False
         self.cycle = []
         self.cycle_idx = 0
@@ -175,8 +138,9 @@ class ControllerWorker(QObject):
             self.logger.stop()
         except Exception:
             pass
+
         try:
-            path = self.logger.start(prefix=prefix or "session")
+            path = self.logger.start(prefix=(prefix or "session"))
             self.logging_on = True
             self._next_flush_t = time.time() + 1.0
             self.status.emit({"ready": True, "log_path": path})
@@ -220,54 +184,66 @@ class ControllerWorker(QObject):
         self.pump_target = {"mode": "duty", "value": 0.0}
         self.starter_target = {"mode": "duty", "value": 0.0}
         self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-        self._psu_cmd_dirty = True
+        self._psu_dirty = True
         self._emit_connected()
 
-    # ----- connect/disconnect
+    # ---- connect/disconnect
     @pyqtSlot(str)
     def cmd_connect_pump(self, port: str) -> None:
+        if not port:
+            return
         try:
             self.pump.connect(port)
             self.log.emit(f"Pump connected: {port}")
         except Exception as e:
-            self._safe_disconnect_pump(str(e))
+            self.error.emit(f"Pump connect error: {e}")
+            self._disconnect_pump()
         self._emit_connected()
 
     @pyqtSlot()
     def cmd_disconnect_pump(self) -> None:
         self.pump_target = {"mode": "duty", "value": 0.0}
-        self._safe_disconnect_pump()
+        self._disconnect_pump()
+        self._emit_connected()
 
     @pyqtSlot(str)
     def cmd_connect_starter(self, port: str) -> None:
+        if not port:
+            return
         try:
             self.starter.connect(port)
             self.log.emit(f"Starter connected: {port}")
         except Exception as e:
-            self._safe_disconnect_starter(str(e))
+            self.error.emit(f"Starter connect error: {e}")
+            self._disconnect_starter()
         self._emit_connected()
 
     @pyqtSlot()
     def cmd_disconnect_starter(self) -> None:
         self.starter_target = {"mode": "duty", "value": 0.0}
-        self._safe_disconnect_starter()
+        self._disconnect_starter()
+        self._emit_connected()
 
     @pyqtSlot(str)
     def cmd_connect_psu(self, port: str) -> None:
+        if not port:
+            return
         try:
             self.psu.connect(port)
             self.log.emit(f"PSU connected: {port}")
         except Exception as e:
-            self._safe_disconnect_psu(str(e))
+            self.error.emit(f"PSU connect error: {e}")
+            self._disconnect_psu()
         self._emit_connected()
 
     @pyqtSlot()
     def cmd_disconnect_psu(self) -> None:
         self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-        self._psu_cmd_dirty = True
-        self._safe_disconnect_psu()
+        self._psu_dirty = True
+        self._disconnect_psu()
+        self._emit_connected()
 
-    # ----- parameters
+    # ---- params
     @pyqtSlot(int)
     def cmd_set_pole_pairs_pump(self, pp: int) -> None:
         self.pole_pairs_pump = max(1, int(pp))
@@ -276,7 +252,7 @@ class ControllerWorker(QObject):
     def cmd_set_pole_pairs_starter(self, pp: int) -> None:
         self.pole_pairs_starter = max(1, int(pp))
 
-    # ----- manual control targets
+    # ---- manual targets
     @pyqtSlot(float)
     def cmd_set_pump_duty(self, duty: float) -> None:
         self.cycle_active = False
@@ -297,24 +273,55 @@ class ControllerWorker(QObject):
         self.cycle_active = False
         self.starter_target = {"mode": "rpm", "value": float(rpm)}
 
-    # ----- PSU control
+    # ---- PSU
     @pyqtSlot(float, float)
     def cmd_psu_set_vi(self, v: float, i: float) -> None:
         self.psu_target["v"] = float(v)
         self.psu_target["i"] = float(i)
-        self._psu_cmd_dirty = True
+        self._psu_dirty = True
 
     @pyqtSlot(bool)
     def cmd_psu_output(self, on: bool) -> None:
         self.psu_target["out"] = bool(on)
-        self._psu_cmd_dirty = True
+        self._psu_dirty = True
 
-    # ---------- cyclogram helper
+    # -------- internals
+    def _emit_connected(self) -> None:
+        self.status.emit({
+            "connected": {
+                "pump": self.pump.is_connected,
+                "starter": self.starter.is_connected,
+                "psu": self.psu.is_connected,
+            },
+            "stage": self.stage,
+            "log_path": self.logger.path,
+        })
+
+    def _disconnect_pump(self) -> None:
+        try:
+            self.pump.disconnect()
+        except Exception:
+            pass
+        self._last_pump = VESCValues()
+
+    def _disconnect_starter(self) -> None:
+        try:
+            self.starter.disconnect()
+        except Exception:
+            pass
+        self._last_starter = VESCValues()
+
+    def _disconnect_psu(self) -> None:
+        try:
+            self.psu.disconnect()
+        except Exception:
+            pass
+        self._last_psu = {}
+
     def _apply_cycle_step(self, step) -> None:
         duration_s, stage, pump_cmd, starter_cmd, psu_cmd = step
         self.stage = stage
 
-        # set targets (continuous)
         self.pump_target = {"mode": pump_cmd.get("mode", "duty"), "value": pump_cmd.get("value", 0.0)}
         self.starter_target = {"mode": starter_cmd.get("mode", "duty"), "value": starter_cmd.get("value", 0.0)}
 
@@ -323,52 +330,68 @@ class ControllerWorker(QObject):
             "i": float(psu_cmd.get("i", 0.0)),
             "out": bool(psu_cmd.get("out", False)),
         }
-        self._psu_cmd_dirty = True
+        self._psu_dirty = True
 
-        self._step_deadline = time.time() + float(duration_s)
+        self._step_end_t = time.time() + float(duration_s)
         self._emit_connected()
 
-    # ---------- tick
-    def _on_tick(self) -> None:
-        if self._polling:
+    def _tick(self) -> None:
+        if self._in_tick:
             return
-        self._polling = True
+        self._in_tick = True
         try:
             now = time.time()
             t = now - self._t0
 
-            # cycle advance
-            if self.cycle_active and self.cycle:
-                if now >= self._step_deadline:
-                    self.cycle_idx += 1
-                    if self.cycle_idx >= len(self.cycle):
-                        self.cycle_active = False
-                        self.stage = "done"
-                        self.pump_target = {"mode": "duty", "value": 0.0}
-                        self.starter_target = {"mode": "duty", "value": 0.0}
-                        self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-                        self._psu_cmd_dirty = True
-                        self._emit_connected()
-                    else:
-                        self._apply_cycle_step(self.cycle[self.cycle_idx])
+            # cycle switch
+            if self.cycle_active and self.cycle and now >= self._step_end_t:
+                self.cycle_idx += 1
+                if self.cycle_idx >= len(self.cycle):
+                    self.cycle_active = False
+                    self.stage = "done"
+                    self.pump_target = {"mode": "duty", "value": 0.0}
+                    self.starter_target = {"mode": "duty", "value": 0.0}
+                    self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                    self._psu_dirty = True
+                    self._emit_connected()
+                else:
+                    self._apply_cycle_step(self.cycle[self.cycle_idx])
 
-            # apply VESC targets (always, like watchdog keep-alive)
-            self._apply_vesc_targets()
+            # VESC keep-alive + request
+            self._vesc_send_and_request(self.pump, self.pump_target, self.pole_pairs_pump, label="pump")
+            self._vesc_send_and_request(self.starter, self.starter_target, self.pole_pairs_starter, label="starter")
 
-            # apply PSU commands (rate limited)
-            self._apply_psu_commands(now)
+            # VESC read
+            pv = self._vesc_read(self.pump, self.pole_pairs_pump, label="pump")
+            if pv is not None:
+                self._last_pump = pv
+            sv = self._vesc_read(self.starter, self.pole_pairs_starter, label="starter")
+            if sv is not None:
+                self._last_starter = sv
 
-            # read devices
-            pump_vals = self._read_vesc(self.pump, self.pole_pairs_pump, timeout_s=0.04, label="Pump")
-            if pump_vals is not None:
-                self._last_pump = pump_vals
+            # PSU command (rate limit)
+            if self.psu.is_connected and self._psu_dirty and now >= self._psu_next_cmd:
+                try:
+                    self.psu.set_vi(self.psu_target["v"], self.psu_target["i"])
+                    self.psu.output(self.psu_target["out"])
+                    self._psu_dirty = False
+                    self._psu_next_cmd = now + 0.2
+                except Exception as e:
+                    self.error.emit(f"PSU cmd error: {e}")
+                    self._disconnect_psu()
+                    self._emit_connected()
 
-            starter_vals = self._read_vesc(self.starter, self.pole_pairs_starter, timeout_s=0.04, label="Starter")
-            if starter_vals is not None:
-                self._last_starter = starter_vals
+            # PSU read (2 Hz)
+            if self.psu.is_connected and now >= self._psu_next_read:
+                try:
+                    self._last_psu = self.psu.read() or {}
+                except Exception as e:
+                    self.error.emit(f"PSU read error: {e}")
+                    self._disconnect_psu()
+                    self._emit_connected()
+                self._psu_next_read = now + 0.5
 
-            self._read_psu(now)
-
+            # emit sample
             sample = {
                 "t": t,
                 "stage": self.stage,
@@ -389,20 +412,21 @@ class ControllerWorker(QObject):
                     "current_motor": self._last_starter.current_motor,
                     "v_in": self._last_starter.v_in,
                 },
-                "psu": self._psu_last_read or {},
+                "psu": self._last_psu,
             }
+            self.sample.emit(sample)
 
-            # log
+            # CSV
             if self.logging_on and self.logger.path:
                 row = [
                     t, self.stage,
                     self._last_pump.rpm_mech, self._last_pump.duty, self._last_pump.current_motor,
                     self._last_starter.rpm_mech, self._last_starter.duty, self._last_starter.current_motor,
-                    float(self._psu_last_read.get("v_set", 0.0)) if self._psu_last_read else 0.0,
-                    float(self._psu_last_read.get("i_set", 0.0)) if self._psu_last_read else 0.0,
-                    float(self._psu_last_read.get("v_out", 0.0)) if self._psu_last_read else 0.0,
-                    float(self._psu_last_read.get("i_out", 0.0)) if self._psu_last_read else 0.0,
-                    float(self._psu_last_read.get("p_out", 0.0)) if self._psu_last_read else 0.0,
+                    float(self._last_psu.get("v_set", 0.0)) if self._last_psu else 0.0,
+                    float(self._last_psu.get("i_set", 0.0)) if self._last_psu else 0.0,
+                    float(self._last_psu.get("v_out", 0.0)) if self._last_psu else 0.0,
+                    float(self._last_psu.get("i_out", 0.0)) if self._last_psu else 0.0,
+                    float(self._last_psu.get("p_out", 0.0)) if self._last_psu else 0.0,
                 ]
                 try:
                     self.logger.write_row(row)
@@ -410,87 +434,43 @@ class ControllerWorker(QObject):
                         self.logger.flush()
                         self._next_flush_t = now + 1.0
                 except Exception as e:
-                    self.error.emit(f"CSV write failed: {e}")
-
-            self.sample.emit(sample)
+                    self.error.emit(f"CSV error: {e}")
 
         finally:
-            self._polling = False
+            self._in_tick = False
 
-    def _apply_vesc_targets(self) -> None:
-        # Pump
-        if self.pump.is_connected:
-            try:
-                if self.pump_target["mode"] == "rpm":
-                    self.pump.set_rpm_mech(self.pump_target["value"], self.pole_pairs_pump)
-                    self.pump.request_values()
-                else:
-                    self.pump.set_duty(self.pump_target["value"])
-                    self.pump.request_values()
-            except (SerialException, OSError) as e:
-                self._safe_disconnect_pump(str(e))
-            except Exception as e:
-                # any unexpected error -> disconnect to be safe
-                self._safe_disconnect_pump(str(e))
+    def _vesc_send_and_request(self, dev: VESCDevice, target: Dict[str, Any], pp: int, label: str) -> None:
+        if not dev.is_connected:
+            return
+        try:
+            if target.get("mode") == "rpm":
+                dev.set_rpm_mech(float(target.get("value", 0.0)), pp)
+            else:
+                dev.set_duty(float(target.get("value", 0.0)))
+            dev.request_values()
+        except (SerialException, OSError) as e:
+            self.error.emit(f"{label} disconnected: {e}")
+            if label == "pump":
+                self._disconnect_pump()
+            else:
+                self._disconnect_starter()
+            self._emit_connected()
+        except Exception as e:
+            self.error.emit(f"{label} error: {e}")
 
-        # Starter
-        if self.starter.is_connected:
-            try:
-                if self.starter_target["mode"] == "rpm":
-                    self.starter.set_rpm_mech(self.starter_target["value"], self.pole_pairs_starter)
-                    self.starter.request_values()
-                else:
-                    self.starter.set_duty(self.starter_target["value"])
-                    self.starter.request_values()
-            except (SerialException, OSError) as e:
-                self._safe_disconnect_starter(str(e))
-            except Exception as e:
-                self._safe_disconnect_starter(str(e))
-
-    def _read_vesc(self, dev: VESCDevice, pp: int, timeout_s: float, label: str) -> Optional[VESCValues]:
+    def _vesc_read(self, dev: VESCDevice, pp: int, label: str) -> Optional[VESCValues]:
         if not dev.is_connected:
             return None
         try:
-            v = dev.read_values(pp, timeout_s=timeout_s)
-            return v
+            return dev.read_values(pp, timeout_s=0.01)
         except (SerialException, OSError) as e:
-            if label == "Pump":
-                self._safe_disconnect_pump(str(e))
+            self.error.emit(f"{label} disconnected: {e}")
+            if label == "pump":
+                self._disconnect_pump()
             else:
-                self._safe_disconnect_starter(str(e))
+                self._disconnect_starter()
+            self._emit_connected()
             return None
         except Exception as e:
-            if label == "Pump":
-                self._safe_disconnect_pump(str(e))
-            else:
-                self._safe_disconnect_starter(str(e))
+            self.error.emit(f"{label} read error: {e}")
             return None
-
-    def _apply_psu_commands(self, now: float) -> None:
-        if not self.psu.is_connected:
-            return
-        if not self._psu_cmd_dirty:
-            return
-        if now < self._psu_next_cmd_t:
-            return
-        try:
-            self.psu.set_vi(self.psu_target["v"], self.psu_target["i"])
-            self.psu.output(self.psu_target["out"])
-            self._psu_cmd_dirty = False
-            self._psu_next_cmd_t = now + 0.2
-        except Exception as e:
-            self._safe_disconnect_psu(str(e))
-
-    def _read_psu(self, now: float) -> None:
-        if not self.psu.is_connected:
-            self._psu_last_read = {}
-            return
-        if now < self._psu_next_read_t:
-            return
-        try:
-            r = self.psu.read()
-            self._psu_last_read = r or {}
-            self._psu_next_read_t = now + 0.5
-        except Exception as e:
-            self._safe_disconnect_psu(str(e))
-            self._psu_last_read = {}
