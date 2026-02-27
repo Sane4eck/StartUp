@@ -66,7 +66,7 @@ class MainWindow(QWidget):
         self._plot_dirty = False
         self._plot_timer = QTimer(self)
         self._plot_timer.timeout.connect(self._redraw_if_dirty)
-        self._plot_timer.start(100)  # 10 FPS
+        self._plot_timer.start(200)  # 10 FPS
 
         # ----- worker thread (clean ownership)
         self.worker_thread = QThread(self)
@@ -335,19 +335,23 @@ class MainWindow(QWidget):
         self.btn_pump_d.clicked.connect(self.sig_disconnect_pump.emit)
         self.btn_pump_set_d.clicked.connect(self._set_pump_duty)
         self.btn_pump_set_r.clicked.connect(self._set_pump_rpm)
-        self.btn_pump_stop.clicked.connect(lambda: self.btn_pump_stop.clicked.connect(self._pump_stop))
+        # self.btn_pump_stop.clicked.connect(lambda: self.btn_pump_stop.clicked.connect(self._pump_stop))
+        self.btn_pump_stop.clicked.connect(self._pump_stop)
 
         self.btn_starter_c.clicked.connect(lambda: self.sig_connect_starter.emit(self.cb_starter.currentText()))
         self.btn_starter_d.clicked.connect(self.sig_disconnect_starter.emit)
         self.btn_starter_set_d.clicked.connect(self._set_starter_duty)
         self.btn_starter_set_r.clicked.connect(self._set_starter_rpm)
-        self.btn_starter_stop.clicked.connect(lambda: self.btn_starter_stop.clicked.connect(self._starter_stop))
+        # self.btn_starter_stop.clicked.connect(lambda: self.btn_starter_stop.clicked.connect(self._starter_stop))
+        self.btn_starter_stop.clicked.connect(self._starter_stop)
 
         self.btn_psu_c.clicked.connect(lambda: self.sig_connect_psu.emit(self.cb_psu.currentText()))
         self.btn_psu_d.clicked.connect(self.sig_disconnect_psu.emit)
         self.btn_psu_set.clicked.connect(self._psu_set_vi)
-        self.btn_psu_on.clicked.connect(lambda: self.btn_psu_on.clicked.connect(self._psu_on))
-        self.btn_psu_off.clicked.connect(lambda: self.btn_psu_off.clicked.connect(self._psu_off))
+        # self.btn_psu_on.clicked.connect(lambda: self.btn_psu_on.clicked.connect(self._psu_on))
+        # self.btn_psu_off.clicked.connect(lambda: self.btn_psu_off.clicked.connect(self._psu_off))
+        self.btn_psu_on.clicked.connect(self._psu_on)
+        self.btn_psu_off.clicked.connect(self._psu_off)
 
         self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
         self.btn_update.clicked.connect(self._update_reset)
@@ -391,6 +395,13 @@ class MainWindow(QWidget):
         self._set_active_buttons(self._starter_mode_buttons, self.btn_starter_stop)
         self._set_active_buttons(self._psu_output_buttons, self.btn_psu_off)
 
+    def _cycle_set_pump_rpm(self):
+        try:
+            rpm = float(self.in_cycle_pump_rpm.text())
+        except Exception:
+            return
+        self.sig_set_pump_rpm.emit(rpm)
+
     def _build_cycle_tab(self):
         layout = QVBoxLayout()
 
@@ -427,6 +438,9 @@ class MainWindow(QWidget):
         gb_live = QGroupBox("Live")
         ll = QHBoxLayout()
 
+        gb_runctl = QGroupBox("Running control")
+        lr = QHBoxLayout()
+
         self.lbl_c_pump = QLabel("Pump: 0 rpm")
         self.lbl_c_pump.setStyleSheet("color: red; font-weight: bold; font-size: 16px;")
 
@@ -450,6 +464,22 @@ class MainWindow(QWidget):
 
         gb_live.setLayout(ll)
         layout.addWidget(gb_live)
+
+        self.in_cycle_pump_rpm = QLineEdit("5000")
+        self.in_cycle_pump_rpm.setFixedWidth(100)
+        self.btn_cycle_set_pump_rpm = QPushButton("Set Pump RPM")
+
+        lr.addWidget(QLabel("Pump RPM:"))
+        lr.addWidget(self.in_cycle_pump_rpm)
+        lr.addWidget(self.btn_cycle_set_pump_rpm)
+        lr.addStretch(1)
+
+        gb_runctl.setLayout(lr)
+        layout.addWidget(gb_runctl)
+
+        self.in_cycle_pump_rpm.returnPressed.connect(self.btn_cycle_set_pump_rpm.click)
+        self.btn_cycle_set_pump_rpm.clicked.connect(self._cycle_set_pump_rpm)
+
 
         def port_row(title: str):
             r = QHBoxLayout()
@@ -476,7 +506,7 @@ class MainWindow(QWidget):
         self.tab_cycle.setLayout(layout)
 
         self.btn_ready2.clicked.connect(lambda: self.sig_ready.emit(self.in_product.text().strip() or "cycle"))
-        self.btn_run.clicked.connect(self.sig_run_cycle.emit)
+        self.btn_run.clicked.connect(lambda: self.sig_run_cycle.emit())
         def _cooling_click():
             try:
                 d = float(self.in_cool_duty.text())
@@ -490,11 +520,15 @@ class MainWindow(QWidget):
         self.btn_update2.clicked.connect(self._update_reset)
 
         self.btn_pump2_c.clicked.connect(lambda: self.sig_connect_pump.emit(self.cb_pump2.currentText()))
-        self.btn_pump2_d.clicked.connect(self.sig_disconnect_pump.emit)
+        # self.btn_pump2_d.clicked.connect(self.sig_disconnect_pump.emit)
+        self.btn_pump2_d.clicked.connect(lambda: self.sig_disconnect_pump.emit())
         self.btn_starter2_c.clicked.connect(lambda: self.sig_connect_starter.emit(self.cb_starter2.currentText()))
-        self.btn_starter2_d.clicked.connect(self.sig_disconnect_starter.emit)
+        # self.btn_starter2_d.clicked.connect(self.sig_disconnect_starter.emit)
+        self.btn_starter2_d.clicked.connect(lambda: self.sig_disconnect_starter.emit())
+
         self.btn_psu2_c.clicked.connect(lambda: self.sig_connect_psu.emit(self.cb_psu2.currentText()))
-        self.btn_psu2_d.clicked.connect(self.sig_disconnect_psu.emit)
+        # self.btn_psu2_d.clicked.connect(self.sig_disconnect_psu.emit)
+        self.btn_psu2_d.clicked.connect(lambda: self.sig_disconnect_psu.emit())
 
     # ---------------- actions
     def refresh_ports(self):
