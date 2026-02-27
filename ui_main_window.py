@@ -355,7 +355,7 @@ class MainWindow(QWidget):
 
         self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
         self.btn_update.clicked.connect(self._update_reset)
-        self.btn_stop_all.clicked.connect(self.sig_stop_all.emit)
+        # self.btn_stop_all.clicked.connect(self.sig_stop_all.emit)
 
         # Pump
         self.in_pump_duty.returnPressed.connect(self.btn_pump_set_d.click)
