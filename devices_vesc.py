@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional
 
 import serial
 from serial import SerialException
@@ -22,12 +22,7 @@ class VESCValues:
 
 
 class VESCDevice:
-    """
-    IO only. No threads inside.
-    All calls must happen from ONE thread (worker thread).
-    """
-
-    def __init__(self, baudrate: int = 115200, timeout: float = 0.02):
+    def __init__(self, baudrate: int = 115200, timeout: float = 0.01):
         self.baudrate = int(baudrate)
         self.timeout = float(timeout)
         self.ser: Optional[serial.Serial] = None
@@ -53,7 +48,7 @@ class VESCDevice:
         except Exception:
             pass
         self._rxbuf = b""
-        time.sleep(0.05)
+        time.sleep(0.03)
 
     def disconnect(self) -> None:
         if self.ser:
@@ -88,11 +83,7 @@ class VESCDevice:
             return
         self.ser.write(encode_request(GetValues))
 
-    def read_values(self, pole_pairs: int, timeout_s: float = 0.05) -> Optional[VESCValues]:
-        """
-        Tries to parse GetValues from stream buffer.
-        Returns None if not received within timeout.
-        """
+    def read_values(self, pole_pairs: int, timeout_s: float = 0.01) -> Optional[VESCValues]:
         if not self.is_connected:
             return None
 
@@ -104,11 +95,9 @@ class VESCDevice:
             if chunk:
                 self._rxbuf += chunk
 
-            # decode may throw on garbage/partial; keep it safe
             try:
                 msg, consumed = decode(self._rxbuf)
             except Exception:
-                # drop buffer if corrupted
                 self._rxbuf = b""
                 msg, consumed = None, 0
 
@@ -121,14 +110,13 @@ class VESCDevice:
                 current = float(getattr(msg, "avg_motor_current", 0.0))
                 v_in = float(getattr(msg, "v_in", 0.0))
                 return VESCValues(
-                    rpm_mech=(erpm / pp),
+                    rpm_mech=erpm / pp,
                     erpm=erpm,
                     duty=duty,
                     current_motor=current,
                     v_in=v_in,
                 )
 
-            # keep buffer bounded
             if len(self._rxbuf) > 4096:
                 self._rxbuf = self._rxbuf[-1024:]
 
