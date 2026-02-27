@@ -54,6 +54,15 @@ class ControllerWorker(QObject):
         super().__init__(parent)
         self.dt = float(dt)
 
+        self.ui_hz = 5.0
+        self.log_hz = 5.0
+        self._ui_dt = 1.0 / self.ui_hz
+        self._log_dt = 1.0 / self.log_hz
+        self._next_ui_emit = 0.0
+        self._next_log_write = 0.0
+
+        self._pump_profile_mtime = None
+
         self._timer = QTimer(self)
         self._timer.setInterval(max(10, int(self.dt * 1000)))
         self._timer.timeout.connect(self._tick)
@@ -108,6 +117,19 @@ class ControllerWorker(QObject):
     def list_ports() -> list[str]:
         return [p.device for p in serial.tools.list_ports.comports()]
 
+    def _ensure_pump_profile(self) -> bool:
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(base, PUMP_PROFILE_XLSX)
+            mtime = os.path.getmtime(path)
+            if (self._pump_profile is None) or (self._pump_profile_mtime != mtime):
+                self._pump_profile = load_pump_profile_xlsx(path, sheet_name=PUMP_PROFILE_SHEET)
+                self._pump_profile_mtime = mtime
+            return bool(self._pump_profile and self._pump_profile.t)
+        except Exception as e:
+            self._fault(f"Cannot load pump cyclogram: {e}")
+            return False
+
     # -------- lifecycle
     @pyqtSlot()
     def start(self) -> None:
@@ -147,6 +169,9 @@ class ControllerWorker(QObject):
 
         try:
             path = self.logger.start(prefix=(prefix or "session"))
+            now = time.time()
+            self._next_ui_emit = now
+            self._next_log_write = now
             self.logging_on = True
             self._next_flush_t = time.time() + 1.0
             self.status.emit({"ready": True, "log_path": path})
@@ -170,6 +195,8 @@ class ControllerWorker(QObject):
             base = os.path.dirname(os.path.abspath(__file__))
             path = os.path.join(base, PUMP_PROFILE_XLSX)
             self._pump_profile = load_pump_profile_xlsx(path, sheet_name=PUMP_PROFILE_SHEET)
+            if not self._ensure_pump_profile():
+                return
             if not self._pump_profile.t:
                 raise RuntimeError("Pump profile is empty")
         except Exception as e:
@@ -543,10 +570,14 @@ class ControllerWorker(QObject):
                 },
                 "psu": self._last_psu,
             }
-            self.sample.emit(sample)
 
-            # --- CSV
-            if self.logging_on and self.logger.path:
+            # --- emit to UI at 5 Hz
+            if now >= self._next_ui_emit:
+                self.sample.emit(sample)
+                self._next_ui_emit = now + self._ui_dt
+
+            # --- CSV at 5 Hz
+            if self.logging_on and self.logger.path and (now >= self._next_log_write):
                 row = [
                     t, self.stage,
                     self._last_pump.rpm_mech, self._last_pump.duty, self._last_pump.current_motor,
@@ -559,6 +590,7 @@ class ControllerWorker(QObject):
                 ]
                 try:
                     self.logger.write_row(row)
+                    self._next_log_write = now + self._log_dt
                     if now >= self._next_flush_t:
                         self.logger.flush()
                         self._next_flush_t = now + 1.0
