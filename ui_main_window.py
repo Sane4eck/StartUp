@@ -29,7 +29,7 @@ class MainWindow(QWidget):
     sig_ready = pyqtSignal(str)
     sig_update_reset = pyqtSignal()
     sig_run_cycle = pyqtSignal()
-    sig_cooling = pyqtSignal()
+    sig_cooling = pyqtSignal(float)
     sig_stop_all = pyqtSignal()
 
     sig_connect_pump = pyqtSignal(str)
@@ -424,6 +424,33 @@ class MainWindow(QWidget):
         gb_ports = QGroupBox("Ports")
         lp = QVBoxLayout()
 
+        gb_live = QGroupBox("Live")
+        ll = QHBoxLayout()
+
+        self.lbl_c_pump = QLabel("Pump: 0 rpm")
+        self.lbl_c_pump.setStyleSheet("color: red; font-weight: bold; font-size: 16px;")
+
+        self.lbl_c_starter = QLabel("Starter: 0 rpm")
+        self.lbl_c_starter.setStyleSheet("color: blue; font-weight: bold; font-size: 16px;")
+
+        self.lbl_c_valve = QLabel("Valve: 0.0V / 0.0A")
+        self.lbl_c_valve.setStyleSheet("color: green; font-weight: bold; font-size: 16px;")
+
+        self.in_cool_duty = QLineEdit("0.05")
+        self.in_cool_duty.setFixedWidth(80)
+
+        ll.addWidget(self.lbl_c_pump)
+        ll.addSpacing(20)
+        ll.addWidget(self.lbl_c_starter)
+        ll.addSpacing(20)
+        ll.addWidget(self.lbl_c_valve)
+        ll.addStretch(1)
+        ll.addWidget(QLabel("Cooling duty:"))
+        ll.addWidget(self.in_cool_duty)
+
+        gb_live.setLayout(ll)
+        layout.addWidget(gb_live)
+
         def port_row(title: str):
             r = QHBoxLayout()
             cb = QComboBox()
@@ -450,7 +477,15 @@ class MainWindow(QWidget):
 
         self.btn_ready2.clicked.connect(lambda: self.sig_ready.emit(self.in_product.text().strip() or "cycle"))
         self.btn_run.clicked.connect(self.sig_run_cycle.emit)
-        self.btn_cooling.clicked.connect(self.sig_cooling.emit)
+        def _cooling_click():
+            try:
+                d = float(self.in_cool_duty.text())
+            except Exception:
+                d = 0.05
+            self.sig_cooling.emit(d)
+
+        self.btn_cooling.clicked.connect(_cooling_click)
+
         self.btn_stop2.clicked.connect(self._stop_all_clicked)
         self.btn_update2.clicked.connect(self._update_reset)
 
@@ -587,7 +622,10 @@ class MainWindow(QWidget):
                 arr.pop(0)
 
         self._plot_dirty = True
-
+        if hasattr(self, "lbl_c_pump"):
+            self.lbl_c_pump.setText(f"Pump: {self.pump_rpm[-1]:.0f} rpm")
+            self.lbl_c_starter.setText(f"Starter: {self.starter_rpm[-1]:.0f} rpm")
+            self.lbl_c_valve.setText(f"Valve: {self.psu_v[-1]:.1f}V / {self.psu_i[-1]:.2f}A")
     def _redraw(self):
         if not self.t:
             self.canvas.draw_idle()
