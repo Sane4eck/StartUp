@@ -82,6 +82,7 @@ class ControllerWorker(QObject):
         self.starter_target = {"mode": "duty", "value": 0.0}
         self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
         self._psu_dirty = False
+        self._psu_applied = {"v": None, "i": None, "out": None}
 
         # last values
         self._last_pump = VESCValues()
@@ -116,6 +117,16 @@ class ControllerWorker(QObject):
     @staticmethod
     def list_ports() -> list[str]:
         return [p.device for p in serial.tools.list_ports.comports()]
+
+    def _set_psu_target(self, v: float, i: float, out: bool):
+        v = float(v);
+        i = float(i);
+        out = bool(out)
+        if (self.psu_target.get("v") == v and self.psu_target.get("i") == i and self.psu_target.get("out") == out):
+            return
+        self.psu_target = {"v": v, "i": i, "out": out}
+        self._psu_dirty = True
+        self._psu_next_cmd = 0.0
 
     def _ensure_pump_profile(self) -> bool:
         try:
@@ -178,7 +189,8 @@ class ControllerWorker(QObject):
         except Exception as e:
             self.logging_on = False
             self.error.emit(f"Logger start failed: {e}")
-
+        # warm-up pump profile (so Run is instant)
+        self._ensure_pump_profile()
         self._emit_connected()
 
     @pyqtSlot()
@@ -190,19 +202,8 @@ class ControllerWorker(QObject):
 
     @pyqtSlot()
     def cmd_run_cycle(self) -> None:
-        # load pump profile
-        try:
-            base = os.path.dirname(os.path.abspath(__file__))
-            path = os.path.join(base, PUMP_PROFILE_XLSX)
-            self._pump_profile = load_pump_profile_xlsx(path, sheet_name=PUMP_PROFILE_SHEET)
-            if not self._ensure_pump_profile():
-                return
-            if not self._pump_profile.t:
-                raise RuntimeError("Pump profile is empty")
-        except Exception as e:
-            self._fault(f"Cannot load pump cyclogram: {e}")
+        if not self._ensure_pump_profile():
             return
-
         self.cycle_active = True
         self._running_manual_pump_enabled = False
         self._enter_state("Starter")
@@ -343,29 +344,33 @@ class ControllerWorker(QObject):
             # starter duty 0.05, pump off, valve off
             self.starter_target = {"mode": "duty", "value": STARTER_DUTY}
             self.pump_target = {"mode": "duty", "value": 0.0}
-            self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-            self._psu_dirty = True
+            # self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+            self._set_psu_target(0.0, 0.0, False)
+            # self._psu_dirty = True
 
         elif name == "Ignition":
             self._ignition_entered = time.time()
             # valve on V1 first
-            self.psu_target = {"v": VALVE_V_1, "i": VALVE_I, "out": True}
+            # self.psu_target = {"v": VALVE_V_1, "i": VALVE_I, "out": True}
+            self._set_psu_target(VALVE_V_1, VALVE_I, True)
             self._psu_dirty = True
 
         elif name == "Running":
             self._running_manual_pump_enabled = True
             # keep valve on V2
             self.psu_target = {"v": VALVE_V_2, "i": VALVE_I, "out": True}
-            self._psu_dirty = True
+            # self._psu_dirty = True
             # keep starter at chosen duty (can change later)
-            self.starter_target = {"mode": "duty", "value": RUNNING_STARTER_DUTY}
+            # self.starter_target = {"mode": "duty", "value": RUNNING_STARTER_DUTY}
+            self._set_psu_target(VALVE_V_2, VALVE_I, True)
 
         elif name == "Cooling":
             # valve off, pump off, starter duty from UI
             self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-            self._psu_dirty = True
+            # self._psu_dirty = True
             self.pump_target = {"mode": "duty", "value": 0.0}
-            self.starter_target = {"mode": "duty", "value": self.cooling_duty}
+            # self.starter_target = {"mode": "duty", "value": self.cooling_duty}
+            self._set_psu_target(0.0, 0.0, False)
 
         elif name == "Fault":
             self._force_all_off()
@@ -444,7 +449,7 @@ class ControllerWorker(QObject):
             self.starter_target = {"mode": "duty", "value": STARTER_DUTY}
             self.pump_target = {"mode": "duty", "value": 0.0}
             self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-            self._psu_dirty = True
+            # self._psu_dirty = True
 
             if self._last_starter.rpm_mech >= STARTER_MIN_RPM:
                 self._enter_state("Ignition")
@@ -464,10 +469,11 @@ class ControllerWorker(QObject):
             duty = _interp_time_value(STARTER_IGNITION_DUTY_PROFILE, st_t)
             self.starter_target = {"mode": "duty", "value": duty}
 
-            # valve V1->V2
-            v = VALVE_V_1 if st_t < VALVE_SWITCH_S else VALVE_V_2
-            self.psu_target = {"v": v, "i": VALVE_I, "out": True}
-            self._psu_dirty = True
+            # valve V1->V2 only when threshold crossed
+            if st_t < VALVE_SWITCH_S:
+                self._set_psu_target(VALVE_V_1, VALVE_I, True)
+            else:
+                self._set_psu_target(VALVE_V_2, VALVE_I, True)
 
             # pump rpm from excel profile
             if self._pump_profile:
@@ -492,7 +498,7 @@ class ControllerWorker(QObject):
         # Cooling: keep starter duty for duration, then stop all
         if st == "Cooling":
             self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
-            self._psu_dirty = True
+            # self._psu_dirty = True
             self.pump_target = {"mode": "duty", "value": 0.0}
             self.starter_target = {"mode": "duty", "value": self.cooling_duty}
             if st_t >= COOLING_DURATION_S:
@@ -534,8 +540,19 @@ class ControllerWorker(QObject):
             # --- PSU apply (rate limit)
             if self.psu.is_connected and self._psu_dirty and now >= self._psu_next_cmd:
                 try:
-                    self.psu.set_vi(self.psu_target["v"], self.psu_target["i"])
-                    self.psu.output(self.psu_target["out"])
+                    v = self.psu_target["v"]
+                    i = self.psu_target["i"]
+                    out = self.psu_target["out"]
+
+                    if self._psu_applied["v"] != v or self._psu_applied["i"] != i:
+                        self.psu.set_vi(v, i)
+                        self._psu_applied["v"] = v
+                        self._psu_applied["i"] = i
+
+                    if self._psu_applied["out"] != out:
+                        self.psu.output(out)
+                        self._psu_applied["out"] = out
+
                     self._psu_dirty = False
                     self._psu_next_cmd = now + 0.2
                 except Exception as e:
