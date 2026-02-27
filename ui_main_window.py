@@ -54,6 +54,11 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Dual VESC + PSU (Manual / Cyclogram)")
 
+        self._plot_dirty = False
+        self._plot_timer = QTimer(self)
+        self._plot_timer.timeout.connect(self._redraw_if_dirty)
+        self._plot_timer.start(100)  # 10 FPS
+
         # ----- worker thread (clean ownership)
         self.worker_thread = QThread(self)
         self.worker = ControllerWorker(dt=0.05)
@@ -512,7 +517,7 @@ class MainWindow(QWidget):
                         self.pump_cur, self.starter_cur, self.psu_v, self.psu_i):
                 arr.pop(0)
 
-        self._redraw()
+        self._plot_dirty = True
 
     def _redraw(self):
         if not self.t:
@@ -544,6 +549,12 @@ class MainWindow(QWidget):
         self.ax_psu_i.relim(); self.ax_psu_i.autoscale_view(True, True, True)
 
         self.canvas.draw_idle()
+
+    def _redraw_if_dirty(self):
+        if not self._plot_dirty:
+            return
+        self._plot_dirty = False
+        self._redraw()
 
     def on_status(self, st: dict):
         if st.get("ready"):
