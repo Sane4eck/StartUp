@@ -280,6 +280,8 @@ class MainWindow(QWidget):
         self.btn_psu_set = QPushButton("Set V/I")
         self.btn_psu_on = QPushButton("Output ON")
         self.btn_psu_off = QPushButton("Output OFF")
+        self.in_psu_v.returnPressed.connect(self.btn_psu_set.click)
+        self.in_psu_i.returnPressed.connect(self.btn_psu_set.click)
 
         r2.addWidget(QLabel("V:"))
         r2.addWidget(self.in_psu_v)
@@ -332,6 +334,14 @@ class MainWindow(QWidget):
         self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
         self.btn_update.clicked.connect(self._update_reset)
         self.btn_stop_all.clicked.connect(self.sig_stop_all.emit)
+
+        # Pump
+        self.in_pump_duty.returnPressed.connect(self.btn_pump_set_d.click)
+        self.in_pump_rpm.returnPressed.connect(self.btn_pump_set_r.click)
+
+        # Starter
+        self.in_starter_duty.returnPressed.connect(self.btn_starter_set_d.click)
+        self.in_starter_rpm.returnPressed.connect(self.btn_starter_set_r.click)
 
     def _build_cycle_tab(self):
         layout = QVBoxLayout()
