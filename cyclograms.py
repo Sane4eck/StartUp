@@ -17,10 +17,10 @@ class StartupCfg:
 
     # Ignition
     valve_v_1: float = 15.0
-    valve_i_1: float = 20.0
     valve_v_2: float = 5.0
-    valve_i_2: float = 20.0
-    ignition_pump_rpm: float = 1200.0
+    valve_i: float = 20.0
+    duration_time_valve: float = 1.5
+    ignition_pump_rpm: float = 1150.
     ignition_min_time_s: float = 0.50
     ignition_timeout_s: float = 4.0
 
