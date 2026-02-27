@@ -398,6 +398,7 @@ class MainWindow(QWidget):
         self.btn_ready2 = QPushButton("Ready")
         self.btn_run = QPushButton("Run")
         self.btn_cooling = QPushButton("Cooling")
+        self.btn_stop2 = QPushButton("Stop")
         self.btn_update2 = QPushButton("Update")
         row.addWidget(self.btn_ready2)
         row.addWidget(self.btn_run)
@@ -449,6 +450,7 @@ class MainWindow(QWidget):
         self.btn_ready2.clicked.connect(lambda: self.sig_ready.emit(self.in_product.text().strip() or "cycle"))
         self.btn_run.clicked.connect(self.sig_run_cycle.emit)
         self.btn_cooling.clicked.connect(self.sig_cooling.emit)
+        self.btn_stop2.clicked.connect(self._stop_all_clicked)
         self.btn_update2.clicked.connect(self._update_reset)
 
         self.btn_pump2_c.clicked.connect(lambda: self.sig_connect_pump.emit(self.cb_pump2.currentText()))
