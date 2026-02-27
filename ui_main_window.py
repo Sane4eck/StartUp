@@ -402,6 +402,7 @@ class MainWindow(QWidget):
         self.btn_update2 = QPushButton("Update")
         row.addWidget(self.btn_ready2)
         row.addWidget(self.btn_run)
+        row.addWidget(self.btn_stop2)
         row.addWidget(self.btn_cooling)
         row.addWidget(self.btn_update2)
         row.addStretch(1)
