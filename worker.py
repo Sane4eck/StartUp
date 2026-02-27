@@ -39,7 +39,7 @@ class ControllerWorker(QObject):
         self.starter = VESCDevice(timeout=0.01)
         self.psu = RidenPSU()
 
-        self.pole_pairs_pump = 3
+        self.pole_pairs_pump = 7
         self.pole_pairs_starter = 3
 
         # continuous targets (keep-alive like VESC watchdog)
