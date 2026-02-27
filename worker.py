@@ -187,6 +187,28 @@ class ControllerWorker(QObject):
         self._psu_dirty = True
         self._emit_connected()
 
+        # IMMEDIATE apply
+        try:
+            if self.pump.is_connected:
+                self.pump.set_duty(0.0)
+                self.pump.request_values()
+        except Exception:
+            pass
+
+        try:
+            if self.starter.is_connected:
+                self.starter.set_duty(0.0)
+                self.starter.request_values()
+        except Exception:
+            pass
+
+        try:
+            if self.psu.is_connected:
+                self.psu.output(False)
+        except Exception:
+            pass
+
+        self._emit_connected()
     # ---- connect/disconnect
     @pyqtSlot(str)
     def cmd_connect_pump(self, port: str) -> None:
