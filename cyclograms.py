@@ -10,14 +10,16 @@ from cycle_fsm import CycleFSM, CycleInputs, CycleTargets, State, Transition, Ho
 class StartupCfg:
     # Starter
     starter_mode: str = "rpm"
-    starter_target_rpm: float = 3000.0
-    starter_ready_rpm: float = 2800.0
+    starter_target_duty: float = 0.55
+    starter_ready_rpm: float = 700.0
     starter_ready_hold_s: float = 0.30
     starter_timeout_s: float = 6.0
 
     # Ignition
-    valve_v: float = 24.0
-    valve_i: float = 5.0
+    valve_v_1: float = 15.0
+    valve_i_1: float = 20.0
+    valve_v_2: float = 5.0
+    valve_i_2: float = 20.0
     ignition_pump_rpm: float = 1200.0
     ignition_min_time_s: float = 0.50
     ignition_timeout_s: float = 4.0
@@ -42,8 +44,8 @@ class StartupCfg:
 @dataclass
 class CoolingCfg:
     valve_off: bool = True
-    cool_starter_rpm: float = 800.0
-    cool_duration_s: float = 8.0
+    cool_starter_duty: float = 0.055
+    cool_duration_s: float = 10.0
 
 
 def build_startup_fsm(cfg: StartupCfg | None = None) -> CycleFSM:
@@ -138,8 +140,8 @@ def build_cooling_fsm(cfg: CoolingCfg | None = None) -> CycleFSM:
     cfg = cfg or CoolingCfg()
 
     def cooling_enter(_inp: CycleInputs, out: CycleTargets):
-        out.pump = {"mode": "duty", "value": 0.0}
-        out.starter = {"mode": "rpm", "value": cfg.cool_starter_rpm}
+        out.pump = {"mode": "rpm", "value": 0.0}
+        out.starter = {"mode": "duty", "value": cfg.cool_starter_duty}
         out.psu = {"v": 0.0, "i": 0.0, "out": False}
 
     def stop_outputs(_inp: CycleInputs, out: CycleTargets):
