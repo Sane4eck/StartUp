@@ -18,13 +18,11 @@ class CSVLogger:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = os.path.join(folder, f"{prefix}_{ts}.csv")
 
-        # line buffered -> менше втрат при аварійному виході
+        # line-buffered
         self.f = open(self.path, "w", newline="", encoding="utf-8", buffering=1)
         self.w = csv.writer(self.f)
-
         self.w.writerow([
-            "t",
-            "stage",
+            "t", "stage",
             "pump_rpm", "pump_duty", "pump_current",
             "starter_rpm", "starter_duty", "starter_current",
             "psu_v_set", "psu_i_set", "psu_v_out", "psu_i_out", "psu_p_out",
