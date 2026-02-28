@@ -19,8 +19,9 @@ from cycle_fsm import CycleInputs, CycleFSM
 from cyclogram_startup import build_startup_fsm, StartupConfig, build_cooling_fsm
 
 
-PUMP_PROFILE_XLSX = "_Cyclogramm.xlsx"
-PUMP_PROFILE_SHEET = None
+# Run-cycle profiles:
+PUMP_PROFILE_XLSX = "_Cyclogram_Pump.xlsx"
+STARTER_PROFILE_XLSX = "_Cyclogram_Starter.xlsx"
 
 
 def _clamp01(x: float) -> float:
@@ -85,11 +86,14 @@ class ControllerWorker(QObject):
         self._fsm_prev_state: Optional[str] = None
         self.startup_cfg = StartupConfig()
 
-        # Startup pump profile cache (_Cyclogramm.xlsx)
-        self._startup_profile: Optional[PumpProfile] = None
-        self._startup_profile_mtime: Optional[float] = None
+        # Run-cycle profiles cache
+        self._pump_profile: Optional[PumpProfile] = None
+        self._pump_profile_mtime: Optional[float] = None
 
-        # Manual pump profile runner (Manual tab)
+        self._starter_profile: Optional[PumpProfile] = None
+        self._starter_profile_mtime: Optional[float] = None
+
+        # Manual pump profile runner (Manual tab) — без Loop
         self._pump_prof_active: bool = False
         self._pump_prof_path: str = ""
         self._pump_prof_mtime: Optional[float] = None
@@ -158,8 +162,8 @@ class ControllerWorker(QObject):
             self.logging_on = False
             self.error.emit(f"Logger start failed: {e}")
 
-        # warm-up startup profile
-        self._ensure_startup_profile()
+        # warm-up both profiles so Run is instant
+        self._ensure_run_profiles()
 
         self._emit_connected()
 
@@ -173,16 +177,17 @@ class ControllerWorker(QObject):
 
     @pyqtSlot()
     def cmd_run_cycle(self) -> None:
-        # stop manual pump profile if active
         self._stop_pump_profile_internal()
 
-        if not self._ensure_startup_profile():
+        if not self._ensure_run_profiles():
             return
 
         now = time.time()
         inp = self._make_inputs(now)
 
-        self._fsm = build_startup_fsm(self._startup_profile, self.startup_cfg)
+        # FuelRamp uses two profiles:
+        # pump_profile: RPM, starter_profile: DUTY
+        self._fsm = build_startup_fsm(self._pump_profile, self._starter_profile, self.startup_cfg)
         self._fsm_prev_state = None
         self._fsm.start(inp)
         self.stage = self._fsm.state
@@ -209,7 +214,7 @@ class ControllerWorker(QObject):
         self._force_all_off()
         self._emit_connected()
 
-    # ---------------- Manual pump profile (no Loop)
+    # ---------------- Manual pump profile (Manual tab)
     @pyqtSlot(str)
     def cmd_start_pump_profile(self, path: str) -> None:
         path = (path or "").strip()
@@ -220,7 +225,6 @@ class ControllerWorker(QObject):
             self.error.emit(f"Pump profile: file not found: {path}")
             return
 
-        # stop Run/Cooling cyclogram
         self._fsm = None
 
         try:
@@ -324,7 +328,7 @@ class ControllerWorker(QObject):
     def cmd_set_pole_pairs_starter(self, pp: int) -> None:
         self.pole_pairs_starter = max(1, int(pp))
 
-    # ---------------- manual control (pump/starter rpm & duty)
+    # ---------------- manual control
     @pyqtSlot(float)
     def cmd_set_pump_rpm(self, rpm: float) -> None:
         self._stop_pump_profile_internal()
@@ -427,17 +431,31 @@ class ControllerWorker(QObject):
         self._psu_dirty = True
         self._psu_next_cmd = 0.0
 
-    def _ensure_startup_profile(self) -> bool:
+    def _ensure_run_profiles(self) -> bool:
+        # load pump profile
         try:
             base = os.path.dirname(os.path.abspath(__file__))
-            path = os.path.join(base, PUMP_PROFILE_XLSX)
-            mtime = os.path.getmtime(path)
-            if (self._startup_profile is None) or (self._startup_profile_mtime != mtime):
-                self._startup_profile = load_pump_profile_xlsx(path, sheet_name=PUMP_PROFILE_SHEET)
-                self._startup_profile_mtime = mtime
-            return bool(self._startup_profile and self._startup_profile.t)
+
+            p_path = os.path.join(base, PUMP_PROFILE_XLSX)
+            p_mtime = os.path.getmtime(p_path)
+            if (self._pump_profile is None) or (self._pump_profile_mtime != p_mtime):
+                self._pump_profile = load_pump_profile_xlsx(p_path, sheet_name=None)
+                self._pump_profile_mtime = p_mtime
+            if not (self._pump_profile and self._pump_profile.t):
+                raise RuntimeError("pump profile empty")
+
+            s_path = os.path.join(base, STARTER_PROFILE_XLSX)
+            s_mtime = os.path.getmtime(s_path)
+            if (self._starter_profile is None) or (self._starter_profile_mtime != s_mtime):
+                self._starter_profile = load_pump_profile_xlsx(s_path, sheet_name=None)
+                self._starter_profile_mtime = s_mtime
+            if not (self._starter_profile and self._starter_profile.t):
+                raise RuntimeError("starter profile empty")
+
+            return True
+
         except Exception as e:
-            self.error.emit(f"Cannot load startup cyclogram: {e}")
+            self.error.emit(f"Cannot load run profiles: {e}")
             return False
 
     def _make_inputs(self, now: float) -> CycleInputs:
@@ -489,12 +507,9 @@ class ControllerWorker(QObject):
             if self._fsm is None and self._pump_prof_active and self._pump_prof is not None:
                 elapsed = now - self._pump_prof_t0
                 end_t = self._pump_prof.end_time
-
                 if end_t > 0.0 and elapsed >= end_t:
-                    # end -> stop profile and stop pump
                     self._stop_pump_profile_internal()
                     self.pump_target = {"mode": "rpm", "value": 0.0}
-
                 if self._pump_prof_active:
                     rpm_cmd = interp_profile(self._pump_prof, elapsed)
                     self.pump_target = {"mode": "rpm", "value": float(rpm_cmd)}
@@ -512,13 +527,14 @@ class ControllerWorker(QObject):
                     if self._fsm.state == "Fault" and reason:
                         self.error.emit(reason)
 
+                # In Running: pump is manual (do NOT overwrite)
                 if self._fsm.state != "Running":
                     self.pump_target = targets.pump
                 self.starter_target = targets.starter
                 self._set_psu_target(targets.psu["v"], targets.psu["i"], targets.psu["out"])
 
-                if not self._fsm.running:
-                    self._fsm = None
+                # NOTE: Running is infinite, so FSM will not auto-stop.
+                # It stops only when user presses Stop (cmd_stop_all) or manual overrides cancel FSM.
 
             # PSU apply only changed
             if self.psu.is_connected and self._psu_dirty and now >= self._psu_next_cmd:
