@@ -1,8 +1,8 @@
 # worker.py
 from __future__ import annotations
 
-import time
 import os
+import time
 from typing import Any, Dict, Optional
 
 import serial.tools.list_ports
@@ -13,9 +13,10 @@ from devices_vesc import VESCDevice, VESCValues
 from devices_psu_riden import RidenPSU
 from logger_csv import CSVLogger
 
-from pump_profile import load_pump_profile_xlsx, PumpProfile
+from pump_profile import load_pump_profile_xlsx, interp_profile, PumpProfile
+
 from cycle_fsm import CycleInputs, CycleFSM
-from cyclogram_startup import build_startup_fsm,  StartupConfig, build_cooling_fsm
+from cyclogram_startup import build_startup_fsm, StartupConfig, build_cooling_fsm
 
 
 PUMP_PROFILE_XLSX = "_Cyclogramm.xlsx"
@@ -50,15 +51,14 @@ class ControllerWorker(QObject):
         self.pole_pairs_pump = 7
         self.pole_pairs_starter = 3
 
-        # Manual targets (BOTH modes allowed)
-        self.pump_target = {"mode": "rpm", "value": 0.0}       # "rpm" or "duty"
-        self.starter_target = {"mode": "duty", "value": 0.0}   # "rpm" or "duty"
+        # Manual targets: pump & starter support BOTH rpm and duty
+        self.pump_target = {"mode": "rpm", "value": 0.0}       # "rpm" | "duty"
+        self.starter_target = {"mode": "duty", "value": 0.0}   # "rpm" | "duty"
 
         self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
         self._psu_dirty = False
         self._psu_applied = {"v": None, "i": None, "out": None}
 
-        # Last measured values (from VESC GetValues)
         self._last_pump = VESCValues()
         self._last_starter = VESCValues()
         self._last_psu: Dict[str, Any] = {}
@@ -80,18 +80,23 @@ class ControllerWorker(QObject):
         self._next_ui_emit = 0.0
         self._next_log_write = 0.0
 
-        # Cyclogram FSM
+        # Run/Cooling cyclogram FSM
         self._fsm: Optional[CycleFSM] = None
         self._fsm_prev_state: Optional[str] = None
-
-        # xlsx profile cache
-        self._pump_profile: Optional[PumpProfile] = None
-        self._pump_profile_mtime: Optional[float] = None
-
-        # startup config (edit in cyclogram_startup.py or set here)
         self.startup_cfg = StartupConfig()
 
-    # ---------------- ports
+        # Startup pump profile cache (_Cyclogramm.xlsx)
+        self._startup_profile: Optional[PumpProfile] = None
+        self._startup_profile_mtime: Optional[float] = None
+
+        # Manual pump profile runner (Manual tab)
+        self._pump_prof_active: bool = False
+        self._pump_prof_path: str = ""
+        self._pump_prof_mtime: Optional[float] = None
+        self._pump_prof: Optional[PumpProfile] = None
+        self._pump_prof_t0: float = 0.0
+        self._pump_prof_prev_stage: str = "idle"
+
     @staticmethod
     def list_ports() -> list[str]:
         return [p.device for p in serial.tools.list_ports.comports()]
@@ -112,6 +117,7 @@ class ControllerWorker(QObject):
             pass
 
         self._fsm = None
+        self._stop_pump_profile_internal()
         self.stage = "stop"
         self._force_all_off()
 
@@ -133,6 +139,7 @@ class ControllerWorker(QObject):
         self._t0 = time.time()
         self.stage = "ready"
         self._fsm = None
+        self._stop_pump_profile_internal()
 
         try:
             self.logger.stop()
@@ -151,8 +158,8 @@ class ControllerWorker(QObject):
             self.logging_on = False
             self.error.emit(f"Logger start failed: {e}")
 
-        # warm-up XLSX
-        self._ensure_pump_profile()
+        # warm-up startup profile
+        self._ensure_startup_profile()
 
         self._emit_connected()
 
@@ -161,16 +168,21 @@ class ControllerWorker(QObject):
         self._t0 = time.time()
         self.stage = "idle"
         self._fsm = None
+        self._stop_pump_profile_internal()
         self._emit_connected()
 
     @pyqtSlot()
     def cmd_run_cycle(self) -> None:
-        if not self._ensure_pump_profile():
+        # stop manual pump profile if active
+        self._stop_pump_profile_internal()
+
+        if not self._ensure_startup_profile():
             return
+
         now = time.time()
         inp = self._make_inputs(now)
 
-        self._fsm = build_startup_fsm(self._pump_profile, self.startup_cfg)
+        self._fsm = build_startup_fsm(self._startup_profile, self.startup_cfg)
         self._fsm_prev_state = None
         self._fsm.start(inp)
         self.stage = self._fsm.state
@@ -178,6 +190,8 @@ class ControllerWorker(QObject):
 
     @pyqtSlot(float)
     def cmd_cooling_cycle(self, duty: float) -> None:
+        self._stop_pump_profile_internal()
+
         now = time.time()
         inp = self._make_inputs(now)
 
@@ -190,8 +204,57 @@ class ControllerWorker(QObject):
     @pyqtSlot()
     def cmd_stop_all(self) -> None:
         self._fsm = None
+        self._stop_pump_profile_internal()
         self.stage = "stop"
         self._force_all_off()
+        self._emit_connected()
+
+    # ---------------- Manual pump profile (no Loop)
+    @pyqtSlot(str)
+    def cmd_start_pump_profile(self, path: str) -> None:
+        path = (path or "").strip()
+        if not path:
+            self.error.emit("Pump profile: empty file path")
+            return
+        if not os.path.exists(path):
+            self.error.emit(f"Pump profile: file not found: {path}")
+            return
+
+        # stop Run/Cooling cyclogram
+        self._fsm = None
+
+        try:
+            mtime = os.path.getmtime(path)
+            if (self._pump_prof is None) or (self._pump_prof_path != path) or (self._pump_prof_mtime != mtime):
+                prof = load_pump_profile_xlsx(path, sheet_name=None)
+                if not prof.t:
+                    raise RuntimeError("profile is empty")
+                self._pump_prof = prof
+                self._pump_prof_path = path
+                self._pump_prof_mtime = mtime
+        except Exception as e:
+            self._pump_prof = None
+            self._pump_prof_path = ""
+            self._pump_prof_mtime = None
+            self.error.emit(f"Pump profile load error: {e}")
+            return
+
+        self._pump_prof_prev_stage = self.stage
+        self.stage = "PumpProfile"
+        self._pump_prof_active = True
+        self._pump_prof_t0 = time.time()
+        self._emit_connected()
+
+    @pyqtSlot()
+    def cmd_stop_pump_profile(self) -> None:
+        self._stop_pump_profile_internal()
+
+    def _stop_pump_profile_internal(self) -> None:
+        if not self._pump_prof_active:
+            return
+        self._pump_prof_active = False
+        self._pump_prof_t0 = 0.0
+        self.stage = self._pump_prof_prev_stage if self._pump_prof_prev_stage else "idle"
         self._emit_connected()
 
     # ---------------- connect/disconnect
@@ -209,7 +272,7 @@ class ControllerWorker(QObject):
 
     @pyqtSlot()
     def cmd_disconnect_pump(self) -> None:
-        # stop pump
+        self._stop_pump_profile_internal()
         self.pump_target = {"mode": "rpm", "value": 0.0}
         self._disconnect_pump()
         self._emit_connected()
@@ -228,6 +291,7 @@ class ControllerWorker(QObject):
 
     @pyqtSlot()
     def cmd_disconnect_starter(self) -> None:
+        self._stop_pump_profile_internal()
         self.starter_target = {"mode": "duty", "value": 0.0}
         self._disconnect_starter()
         self._emit_connected()
@@ -246,6 +310,7 @@ class ControllerWorker(QObject):
 
     @pyqtSlot()
     def cmd_disconnect_psu(self) -> None:
+        self._stop_pump_profile_internal()
         self._set_psu_target(0.0, 0.0, False)
         self._disconnect_psu()
         self._emit_connected()
@@ -259,13 +324,10 @@ class ControllerWorker(QObject):
     def cmd_set_pole_pairs_starter(self, pp: int) -> None:
         self.pole_pairs_starter = max(1, int(pp))
 
-    # ---------------- manual control
-    # Manual for BOTH: pump (rpm/duty), starter (rpm/duty)
-    # During cyclogram:
-    #   - if state == Running: allow pump manual (rpm/duty) WITHOUT cancel
-    #   - starter manual cancels cyclogram (to avoid conflict)
+    # ---------------- manual control (pump/starter rpm & duty)
     @pyqtSlot(float)
     def cmd_set_pump_rpm(self, rpm: float) -> None:
+        self._stop_pump_profile_internal()
         if self._fsm is not None and self._fsm.state == "Running":
             self.pump_target = {"mode": "rpm", "value": float(rpm)}
             return
@@ -274,6 +336,7 @@ class ControllerWorker(QObject):
 
     @pyqtSlot(float)
     def cmd_set_pump_duty(self, duty: float) -> None:
+        self._stop_pump_profile_internal()
         if self._fsm is not None and self._fsm.state == "Running":
             self.pump_target = {"mode": "duty", "value": _clamp01(duty)}
             return
@@ -282,22 +345,26 @@ class ControllerWorker(QObject):
 
     @pyqtSlot(float)
     def cmd_set_starter_duty(self, duty: float) -> None:
+        self._stop_pump_profile_internal()
         self._fsm = None
         self.starter_target = {"mode": "duty", "value": _clamp01(duty)}
 
     @pyqtSlot(float)
     def cmd_set_starter_rpm(self, rpm: float) -> None:
+        self._stop_pump_profile_internal()
         self._fsm = None
         self.starter_target = {"mode": "rpm", "value": float(rpm)}
 
     # ---------------- PSU manual
     @pyqtSlot(float, float)
     def cmd_psu_set_vi(self, v: float, i: float) -> None:
+        self._stop_pump_profile_internal()
         self._fsm = None
         self._set_psu_target(float(v), float(i), bool(self.psu_target.get("out", False)))
 
     @pyqtSlot(bool)
     def cmd_psu_output(self, on: bool) -> None:
+        self._stop_pump_profile_internal()
         self._fsm = None
         self._set_psu_target(float(self.psu_target.get("v", 0.0)), float(self.psu_target.get("i", 0.0)), bool(on))
 
@@ -311,6 +378,10 @@ class ControllerWorker(QObject):
             },
             "stage": self.stage,
             "log_path": self.logger.path,
+            "pump_profile": {
+                "active": self._pump_prof_active,
+                "path": self._pump_prof_path,
+            }
         })
 
     def _disconnect_pump(self) -> None:
@@ -335,11 +406,9 @@ class ControllerWorker(QObject):
         self._last_psu = {}
 
     def _force_all_off(self):
-        # stop both devices safely
         self.pump_target = {"mode": "rpm", "value": 0.0}
         self.starter_target = {"mode": "duty", "value": 0.0}
         self._set_psu_target(0.0, 0.0, False)
-
         try:
             if self.pump.is_connected:
                 self.pump.set_rpm_mech(0.0, self.pole_pairs_pump)
@@ -358,17 +427,17 @@ class ControllerWorker(QObject):
         self._psu_dirty = True
         self._psu_next_cmd = 0.0
 
-    def _ensure_pump_profile(self) -> bool:
+    def _ensure_startup_profile(self) -> bool:
         try:
             base = os.path.dirname(os.path.abspath(__file__))
             path = os.path.join(base, PUMP_PROFILE_XLSX)
             mtime = os.path.getmtime(path)
-            if (self._pump_profile is None) or (self._pump_profile_mtime != mtime):
-                self._pump_profile = load_pump_profile_xlsx(path, sheet_name=PUMP_PROFILE_SHEET)
-                self._pump_profile_mtime = mtime
-            return bool(self._pump_profile and self._pump_profile.t)
+            if (self._startup_profile is None) or (self._startup_profile_mtime != mtime):
+                self._startup_profile = load_pump_profile_xlsx(path, sheet_name=PUMP_PROFILE_SHEET)
+                self._startup_profile_mtime = mtime
+            return bool(self._startup_profile and self._startup_profile.t)
         except Exception as e:
-            self.error.emit(f"Cannot load pump cyclogram: {e}")
+            self.error.emit(f"Cannot load startup cyclogram: {e}")
             return False
 
     def _make_inputs(self, now: float) -> CycleInputs:
@@ -376,7 +445,6 @@ class ControllerWorker(QObject):
         state_t = 0.0
         if self._fsm is not None:
             state_t = self._fsm.state_time(now)
-
         return CycleInputs(
             now=now,
             t=t,
@@ -399,16 +467,15 @@ class ControllerWorker(QObject):
             now = time.time()
             t = now - self._t0
 
-            # read VESC values (previous request)
+            # read vesc
             pv = self._vesc_read(self.pump, self.pole_pairs_pump, label="pump")
             if pv is not None:
                 self._last_pump = pv
-
             sv = self._vesc_read(self.starter, self.pole_pairs_starter, label="starter")
             if sv is not None:
                 self._last_starter = sv
 
-            # read PSU (2 Hz)
+            # read psu (2 Hz)
             if self.psu.is_connected and now >= self._psu_next_read:
                 try:
                     self._last_psu = self.psu.read() or {}
@@ -418,31 +485,42 @@ class ControllerWorker(QObject):
                     self._emit_connected()
                 self._psu_next_read = now + 0.5
 
-            # cyclogram tick
+            # Manual pump profile takes control ONLY if no FSM
+            if self._fsm is None and self._pump_prof_active and self._pump_prof is not None:
+                elapsed = now - self._pump_prof_t0
+                end_t = self._pump_prof.end_time
+
+                if end_t > 0.0 and elapsed >= end_t:
+                    # end -> stop profile and stop pump
+                    self._stop_pump_profile_internal()
+                    self.pump_target = {"mode": "rpm", "value": 0.0}
+
+                if self._pump_prof_active:
+                    rpm_cmd = interp_profile(self._pump_prof, elapsed)
+                    self.pump_target = {"mode": "rpm", "value": float(rpm_cmd)}
+                    self.stage = "PumpProfile"
+
+            # Run/Cooling cyclogram
             if self._fsm is not None:
                 inp = self._make_inputs(now)
                 targets = self._fsm.tick(inp)
                 self.stage = self._fsm.state
 
-                # one-time fault reason
                 if self._fsm.state != self._fsm_prev_state:
                     self._fsm_prev_state = self._fsm.state
                     reason = targets.meta.get("transition_reason")
                     if self._fsm.state == "Fault" and reason:
                         self.error.emit(reason)
 
-                # APPLY CYCLOGRAM RULES:
-                # - pump only RPM during cyclogram, except Running (manual)
-                # - starter only DUTY during cyclogram (always)
                 if self._fsm.state != "Running":
-                    self.pump_target = targets.pump  # should be rpm-only by design
-                self.starter_target = targets.starter  # duty-only by design
+                    self.pump_target = targets.pump
+                self.starter_target = targets.starter
                 self._set_psu_target(targets.psu["v"], targets.psu["i"], targets.psu["out"])
 
                 if not self._fsm.running:
                     self._fsm = None
 
-            # PSU apply only if changed
+            # PSU apply only changed
             if self.psu.is_connected and self._psu_dirty and now >= self._psu_next_cmd:
                 try:
                     v = self.psu_target["v"]
@@ -465,7 +543,7 @@ class ControllerWorker(QObject):
                     self._disconnect_psu()
                     self._emit_connected()
 
-            # Send control + request new values
+            # send targets + request values
             self._vesc_send_and_request(self.pump, self.pump_target, self.pole_pairs_pump, "pump")
             self._vesc_send_and_request(self.starter, self.starter_target, self.pole_pairs_starter, "starter")
 
@@ -526,12 +604,10 @@ class ControllerWorker(QObject):
         try:
             mode = str(target.get("mode", "duty"))
             val = float(target.get("value", 0.0))
-
             if mode == "rpm":
                 dev.set_rpm_mech(val, pp)
             else:
                 dev.set_duty(_clamp01(val))
-
             dev.request_values()
         except (SerialException, OSError) as e:
             self.error.emit(f"{label} disconnected: {e}")
