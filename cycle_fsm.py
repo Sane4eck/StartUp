@@ -8,8 +8,8 @@ from typing import Callable, Dict, List, Optional, Any
 @dataclass
 class CycleInputs:
     now: float
-    t: float                 # time since session start
-    state_t: float           # time since current state entered
+    t: float           # time since session start
+    state_t: float     # time since current state entered
 
     pump_rpm: float
     starter_rpm: float
@@ -23,13 +23,17 @@ class CycleInputs:
 
 @dataclass
 class CycleTargets:
-    pump: Dict[str, Any] = field(default_factory=lambda: {"mode": "duty", "value": 0.0})
+    # IMPORTANT: pump = RPM only, starter = DUTY only
+    pump: Dict[str, Any] = field(default_factory=lambda: {"mode": "rpm", "value": 0.0})
     starter: Dict[str, Any] = field(default_factory=lambda: {"mode": "duty", "value": 0.0})
     psu: Dict[str, Any] = field(default_factory=lambda: {"v": 0.0, "i": 0.0, "out": False})
 
+    # for messages/fault reasons etc.
+    meta: Dict[str, Any] = field(default_factory=dict)
+
 
 class Hold:
-    """Condition wrapper: predicate must be True continuously for hold_s seconds."""
+    """Predicate must be True continuously for hold_s seconds."""
     def __init__(self, predicate: Callable[[CycleInputs], bool], hold_s: float):
         self.predicate = predicate
         self.hold_s = float(hold_s)
@@ -51,6 +55,7 @@ class Hold:
 class Transition:
     cond: Callable[[CycleInputs], bool]
     next_state: str
+    reason: Optional[str] = None
 
 
 @dataclass
@@ -62,8 +67,9 @@ class State:
 
     timeout_s: Optional[float] = None
     on_timeout: Optional[str] = None
+    timeout_reason: Optional[str] = None
 
-    terminal: bool = False  # if True -> FSM stops running when entering this state
+    terminal: bool = False
 
 
 class CycleFSM:
@@ -78,51 +84,56 @@ class CycleFSM:
 
         self.targets = CycleTargets()
 
+        self.last_state: Optional[str] = None
+        self.last_transition_reason: Optional[str] = None
+
     @property
     def state(self) -> str:
         return self.current
 
     def start(self, inp: CycleInputs):
         self.running = True
-        self._switch(inp, self.initial)
+        self._switch(inp, self.initial, reason=None)
 
-    def stop(self, inp: CycleInputs):
+    def stop(self, inp: CycleInputs, reason: str | None = None):
         self.running = False
-        self._switch(inp, self.stop_state)
+        self._switch(inp, self.stop_state, reason=reason)
 
     def tick(self, inp: CycleInputs) -> CycleTargets:
+        # clear per-tick meta
+        self.targets.meta.clear()
+        self.last_transition_reason = None
+
         st = self.states[self.current]
 
-        # state behavior
         if st.on_tick:
             st.on_tick(inp, self.targets)
 
         # timeout
         if st.timeout_s is not None and st.on_timeout:
             if inp.state_t >= float(st.timeout_s):
-                self._switch(inp, st.on_timeout)
+                self._switch(inp, st.on_timeout, reason=st.timeout_reason)
                 st = self.states[self.current]
 
         # transitions
         for tr in st.transitions:
-            # resettable conditions (Hold)
-            # (reset is done on state enter, here just evaluate)
             if tr.cond(inp):
-                self._switch(inp, tr.next_state)
+                self._switch(inp, tr.next_state, reason=tr.reason)
                 st = self.states[self.current]
                 break
 
-        # terminal state ends run
         if st.terminal:
             self.running = False
 
         return self.targets
 
-    def _switch(self, inp: CycleInputs, next_state: str):
+    def _switch(self, inp: CycleInputs, next_state: str, reason: Optional[str]):
+        self.last_state = self.current
         self.current = next_state
         self._state_enter_time = inp.now
+        self.last_transition_reason = reason
 
-        # reset Hold conditions for this state's transitions
+        # reset Hold conditions for new state's transitions
         st = self.states[self.current]
         for tr in st.transitions:
             if hasattr(tr.cond, "reset"):
@@ -131,7 +142,9 @@ class CycleFSM:
                 except Exception:
                     pass
 
-        # on_enter
+        if reason:
+            self.targets.meta["transition_reason"] = reason
+
         if st.on_enter:
             st.on_enter(inp, self.targets)
 
