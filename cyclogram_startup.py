@@ -2,184 +2,155 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
 
 from cycle_fsm import CycleFSM, CycleInputs, CycleTargets, State, Transition, Hold
 from pump_profile import PumpProfile, interp_profile
 
 
-# ============================
-# 1) НАЛАШТУВАННЯ (ТЕ, ЩО ТИ МІНЯЄШ НАЙЧАСТІШЕ)
-# ============================
+# =========================================================
+# ЦИКЛОГРАМА: Starter -> FuelRamp -> Running
+# FuelRamp керує:
+#   - насос: RPM з _Cyclogram_Pump.xlsx
+#   - стартер: DUTY з _Cyclogram_Starter.xlsx
+#   - клапан: 15V 2s -> 5V до 12000 rpm -> 0V
+# Running:
+#   - насос: ручне керування оператором
+#   - стартер: тримаємо останнє значення з профілю або константу
+#   - клапан: 0V (off)
+# =========================================================
+
+
 @dataclass
 class StartupConfig:
-    # --- Starter
-    starter_duty_start: float = 0.05
+    # -------- Starter
+    starter_duty_start: float = 0.055
     starter_timeout_s: float = 10.0
     starter_min_rpm: float = 500.0
-    starter_min_hold_s: float = 0.15   # щоб rpm трималось, а не "пікнуло"
+    starter_min_hold_s: float = 0.2
 
-    # --- Ignition
-    ignition_timeout_s: float = 20.0
-    valve_v1: float = 12.0
-    valve_v2: float = 5.0
-    valve_i: float = 20.0
-    valve_switch_s: float = 1.5
+    # -------- Valve behavior in FuelRamp (твоя вимога)
+    valve_i: float = 20.0              # струм PSU для клапана (A)
+    valve_v_high: float = 18.0        # перші 1 секунди
+    valve_high_time_s: float = 2.0
+    valve_v_hold: float = 5.0         # після 1с до порогу rpm
+    valve_rpm_threshold: float = 21000.0  # після досягнення -> 0V/off
 
-    # стартер під час Ignition: маленька циклограма duty
-    starter_duty_profile_ign: List[Tuple[float, float]] = None
+    # -------- FuelRamp
+    fuelramp_timeout_s: float = 120.0  # safety таймаут
+    # Перехід FuelRamp->Running: закінчення профілю насоса (див. pump_profile_done)
 
-    # умова завершення Ignition (приклад):
-    ignition_min_starter_rpm: float = 2000.0
-    ignition_hold_s: float = 0.20
+    # -------- Running (нескінченний)
+    running_starter_use_const: bool = False
+    running_starter_duty_const: float = 0.00
 
-    # --- FuelRamp
-    fuelramp_timeout_s: float = 20.0
-    fuelramp_finish_starter_rpm: float = 20000.0
-    fuelramp_finish_hold_s: float = 0.30
 
-    # --- Running
-    running_starter_duty: float = 0.075
-    # В Running насосом керує оператор вручну.
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
 
-    def __post_init__(self):
-        if self.starter_duty_profile_ign is None:
-            self.starter_duty_profile_ign = [
-                (0.0, 0.05),
-                (2.0, 0.055),
-                (4.0, 0.06),
-                (6.0, 0.065),
-            ]
-@dataclass
-class CoolingConfig:
-    duration_s: float = 8.0
 
-# ============================
-# 2) ДОПОМІЖНІ ФУНКЦІЇ (зрозумілі команди)
-# ============================
 def set_pump_rpm(out: CycleTargets, rpm: float):
     out.pump = {"mode": "rpm", "value": float(rpm)}
 
+
 def set_starter_duty(out: CycleTargets, duty: float):
-    out.starter = {"mode": "duty", "value": float(duty)}
+    out.starter = {"mode": "duty", "value": _clamp01(duty)}
+
 
 def set_valve(out: CycleTargets, v: float, i: float, on: bool):
     out.psu = {"v": float(v), "i": float(i), "out": bool(on)}
+
 
 def stop_all(out: CycleTargets):
     set_pump_rpm(out, 0.0)
     set_starter_duty(out, 0.0)
     set_valve(out, 0.0, 0.0, False)
 
-def interp_time_value(points: List[Tuple[float, float]], t: float) -> float:
-    """лінійна інтерполяція (час->значення)"""
-    if not points:
-        return 0.0
-    x = float(t)
-    if x <= points[0][0]:
-        return float(points[0][1])
-    if x >= points[-1][0]:
-        return float(points[-1][1])
-    for k in range(1, len(points)):
-        if x <= points[k][0]:
-            t0, t1 = float(points[k-1][0]), float(points[k][0])
-            y0, y1 = float(points[k-1][1]), float(points[k][1])
-            if t1 <= t0:
-                return y1
-            a = (x - t0) / (t1 - t0)
-            return y0 + a * (y1 - y0)
-    return float(points[-1][1])
 
-
-# ============================
-# 3) ПОБУДОВА FSM
-# ============================
-def build_startup_fsm(profile: PumpProfile, cfg: StartupConfig | None = None) -> CycleFSM:
+def build_startup_fsm(
+    pump_profile: PumpProfile,          # _Cyclogram_Pump.xlsx (value = RPM)
+    starter_profile: PumpProfile,       # _Cyclogram_Starter.xlsx (value = DUTY 0..1)
+    cfg: StartupConfig | None = None,
+) -> CycleFSM:
     cfg = cfg or StartupConfig()
 
-    # ----------------------------
-    # 3.1 УМОВИ (ТУТ ТИ ДОДАЄШ/ПРАВИШ УМОВИ)
-    # ----------------------------
-
-    # Starter -> Ignition: стартер має досягти 500 rpm і потримати 0.15с
+    # ---------------- CONDITIONS
     starter_ready = Hold(lambda i: i.starter_rpm >= cfg.starter_min_rpm, cfg.starter_min_hold_s)
 
-    # Ignition -> FuelRamp: приклад умови (можеш замінити на іншу):
-    ignition_ready = Hold(lambda i: i.starter_rpm >= cfg.ignition_min_starter_rpm, cfg.ignition_hold_s)
+    def pump_profile_done(i: CycleInputs) -> bool:
+        # УМОВА переходу FuelRamp -> Running: профіль насоса закінчився
+        return i.state_t >= pump_profile.end_time
 
-    # FuelRamp -> Running: закінчився профіль насоса + стартер >= 20000 rpm (потримати)
-    ramp_done_time = lambda i: i.state_t >= profile.end_time
-    ramp_ready = Hold(lambda i: i.starter_rpm >= cfg.fuelramp_finish_starter_rpm, cfg.fuelramp_finish_hold_s)
-
-    def go_running(i: CycleInputs) -> bool:
-        return ramp_done_time(i) and ramp_ready(i)
-
-    # ----------------------------
-    # 3.2 ЩО РОБИТЬ КОЖЕН СТАН
-    # ----------------------------
-
-    # Stop: все вимкнути
+    # ---------------- STATE BEHAVIOR
     def stop_enter(_i: CycleInputs, out: CycleTargets):
         stop_all(out)
 
-    # Fault: все вимкнути + повідомлення
     def fault_enter(_i: CycleInputs, out: CycleTargets):
         stop_all(out)
         out.meta["fault"] = out.meta.get("transition_reason", "Fault")
 
-    # Starter: стартер duty=0.05, насос 0, клапан off
+    # ---------- Starter
     def starter_enter(_i: CycleInputs, out: CycleTargets):
         set_starter_duty(out, cfg.starter_duty_start)
         set_pump_rpm(out, 0.0)
         set_valve(out, 0.0, 0.0, False)
 
-    # Ignition: клапан on (V1->V2), стартер по профілю, насос по профілю (підготовка)
-    def ignition_enter(_i: CycleInputs, out: CycleTargets):
-        set_valve(out, cfg.valve_v1, cfg.valve_i, True)
+    def starter_tick(_i: CycleInputs, out: CycleTargets):
+        set_starter_duty(out, cfg.starter_duty_start)
+        set_pump_rpm(out, 0.0)
+        set_valve(out, 0.0, 0.0, False)
 
-    def ignition_tick(i: CycleInputs, out: CycleTargets):
-        # starter duty by profile
-        d = interp_time_value(cfg.starter_duty_profile_ign, i.state_t)
-        set_starter_duty(out, d)
-
-        # valve V1->V2 by time
-        v = cfg.valve_v1 if i.state_t < cfg.valve_switch_s else cfg.valve_v2
-        set_valve(out, v, cfg.valve_i, True)
-
-        # pump rpm from xlsx profile (поки що також тут)
-        set_pump_rpm(out, interp_profile(profile, i.state_t))
-
-    # FuelRamp: основний ramp насоса (з Excel), стартер тримаємо останнє duty, клапан on
+    # ---------- FuelRamp (єдиний режим для ramp + логіка клапана)
     def fuelramp_enter(_i: CycleInputs, out: CycleTargets):
-        # при вході нічого особливого, усе робимо в tick
+        # нічого особливого — керування в tick
         pass
 
     def fuelramp_tick(i: CycleInputs, out: CycleTargets):
-        # valve on (V2)
-        set_valve(out, cfg.valve_v2, cfg.valve_i, True)
+        # 1) стартер DUTY з профілю
+        duty_cmd = interp_profile(starter_profile, i.state_t)
+        set_starter_duty(out, duty_cmd)
 
-        # starter: тримаємо останнє значення профілю (або можеш зробити окремий профіль)
-        last_d = cfg.starter_duty_profile_ign[-1][1]
-        set_starter_duty(out, last_d)
+        # 2) насос RPM з профілю
+        rpm_cmd = interp_profile(pump_profile, i.state_t)
+        set_pump_rpm(out, rpm_cmd)
 
-        # pump: по Excel профілю (це і є ramp)
-        set_pump_rpm(out, interp_profile(profile, i.state_t))
+        # 3) клапан (твоя логіка):
+        #    - 0..2с: 15V
+        #    - після 2с: 5V доки starter_rpm < 12000
+        #    - коли starter_rpm >= 12000: 0V (off)
+        if i.state_t < cfg.valve_high_time_s:
+            set_valve(out, cfg.valve_v_high, cfg.valve_i, True)
+        else:
+            if i.starter_rpm < cfg.valve_rpm_threshold:
+                set_valve(out, cfg.valve_v_hold, cfg.valve_i, True)
+            else:
+                set_valve(out, 0.0, 0.0, False)
 
-    # Running: клапан on, стартер фіксовано, насос НЕ ЧІПАЄМО (оператор)
+    # ---------- Running (нескінченний)
     def running_enter(_i: CycleInputs, out: CycleTargets):
-        set_valve(out, cfg.valve_v2, cfg.valve_i, True)
-        set_starter_duty(out, cfg.running_starter_duty)
-        # спеціальна мітка: в worker насос не перезаписується в Running
+        # клапан завжди off у Running
+        set_valve(out, 0.0, 0.0, False)
+
+        # стартер тримаємо
+        if cfg.running_starter_use_const:
+            set_starter_duty(out, cfg.running_starter_duty_const)
+        else:
+            # останнє значення зі стартового профілю
+            last = starter_profile.rpm[-1] if starter_profile.rpm else 0.0
+            set_starter_duty(out, last)
+
+        # насос НЕ задаємо (оператор керує вручну)
         out.meta["running_manual_pump"] = True
 
     def running_tick(_i: CycleInputs, out: CycleTargets):
-        set_valve(out, cfg.valve_v2, cfg.valve_i, True)
-        set_starter_duty(out, cfg.running_starter_duty)
-        # насос не задаємо
+        set_valve(out, 0.0, 0.0, False)
+        if cfg.running_starter_use_const:
+            set_starter_duty(out, cfg.running_starter_duty_const)
+        else:
+            last = starter_profile.rpm[-1] if starter_profile.rpm else 0.0
+            set_starter_duty(out, last)
+        # pump not set
 
-    # ----------------------------
-    # 3.3 ПЕРЕХОДИ (ПОСЛІДОВНО, НЕ МОЖНА ПРОПУСТИТИ)
-    # ----------------------------
+    # ---------------- STATES + TRANSITIONS
     states = {
         "Stop": State("Stop", on_enter=stop_enter, terminal=True),
         "Fault": State("Fault", on_enter=fault_enter, terminal=True),
@@ -187,24 +158,13 @@ def build_startup_fsm(profile: PumpProfile, cfg: StartupConfig | None = None) ->
         "Starter": State(
             "Starter",
             on_enter=starter_enter,
+            on_tick=starter_tick,
             transitions=[
-                Transition(starter_ready, "Ignition", reason="OK: Starter reached rpm"),
+                Transition(starter_ready, "FuelRamp", reason="OK: Starter reached rpm"),
             ],
             timeout_s=cfg.starter_timeout_s,
             on_timeout="Fault",
             timeout_reason=f"Stop: Starter did not reach {cfg.starter_min_rpm:.0f} rpm in {cfg.starter_timeout_s:.0f}s",
-        ),
-
-        "Ignition": State(
-            "Ignition",
-            on_enter=ignition_enter,
-            on_tick=ignition_tick,
-            transitions=[
-                Transition(ignition_ready, "FuelRamp", reason="OK: Ignition condition reached"),
-            ],
-            timeout_s=cfg.ignition_timeout_s,
-            on_timeout="Fault",
-            timeout_reason=f"Stop: Ignition timeout {cfg.ignition_timeout_s:.0f}s",
         ),
 
         "FuelRamp": State(
@@ -212,7 +172,7 @@ def build_startup_fsm(profile: PumpProfile, cfg: StartupConfig | None = None) ->
             on_enter=fuelramp_enter,
             on_tick=fuelramp_tick,
             transitions=[
-                Transition(go_running, "Running", reason="OK: FuelRamp done"),
+                Transition(pump_profile_done, "Running", reason="OK: Pump profile finished"),
             ],
             timeout_s=cfg.fuelramp_timeout_s,
             on_timeout="Fault",
@@ -229,15 +189,10 @@ def build_startup_fsm(profile: PumpProfile, cfg: StartupConfig | None = None) ->
     return CycleFSM(states=states, initial="Starter", stop_state="Stop")
 
 
-# ============================
-# COOLING FSM
-# ============================
-def build_cooling_fsm(duty: float, cfg: CoolingConfig | None = None) -> CycleFSM:
-    cfg = cfg or CoolingConfig()
-    duty = max(0.0, min(1.0, float(duty)))
+def build_cooling_fsm(duty: float, duration_s: float = 500.0) -> CycleFSM:
+    duty = _clamp01(duty)
 
     def cooling_enter(_i: CycleInputs, out: CycleTargets):
-        # cooling: starter duty = duty, pump off, valve off
         set_starter_duty(out, duty)
         set_pump_rpm(out, 0.0)
         set_valve(out, 0.0, 0.0, False)
@@ -250,10 +205,9 @@ def build_cooling_fsm(duty: float, cfg: CoolingConfig | None = None) -> CycleFSM
             "Cooling",
             on_enter=cooling_enter,
             transitions=[
-                Transition(lambda i: i.state_t >= cfg.duration_s, "Stop", reason="Cooling done"),
+                Transition(lambda i: i.state_t >= duration_s, "Stop", reason="Cooling done"),
             ],
         ),
         "Stop": State("Stop", on_enter=stop_enter, terminal=True),
     }
-
     return CycleFSM(states=states, initial="Cooling", stop_state="Stop")
