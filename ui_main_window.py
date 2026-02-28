@@ -1,12 +1,10 @@
 # ui_main_window.py
 from __future__ import annotations
 
-import os
-
 from PyQt5.QtCore import QTimer, pyqtSignal, Qt, QThread, QMetaObject
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QLineEdit,
-    QTabWidget, QGroupBox, QSizePolicy, QFileDialog
+    QGroupBox, QSizePolicy, QFileDialog
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
 from matplotlib.figure import Figure
@@ -51,13 +49,17 @@ class MainWindow(QWidget):
     sig_psu_set_vi = pyqtSignal(float, float)
     sig_psu_output = pyqtSignal(bool)
 
-    # NEW: pump profile on Manual tab (no Loop)
+    # pump profile on Manual tab (no Loop)
     sig_pump_profile_start = pyqtSignal(str)  # path
     sig_pump_profile_stop = pyqtSignal()
 
+    # NEW: Valve macro
+    sig_valve_on = pyqtSignal()
+    sig_valve_off = pyqtSignal()
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dual VESC + PSU (Manual / Cyclogram)")
+        self.setWindowTitle("Dual VESC + PSU (Manual)")
 
         self.setStyleSheet(self.styleSheet() + """
         QPushButton[active="true"] {
@@ -82,7 +84,6 @@ class MainWindow(QWidget):
         self.worker.sample.connect(self.on_sample)
         self.worker.status.connect(self.on_status)
         self.worker.error.connect(self.on_error)
-        self.worker.log.connect(self.on_log)
 
         # connect signals -> slots
         self.sig_ready.connect(self.worker.cmd_ready)
@@ -109,9 +110,12 @@ class MainWindow(QWidget):
         self.sig_psu_set_vi.connect(self.worker.cmd_psu_set_vi)
         self.sig_psu_output.connect(self.worker.cmd_psu_output)
 
-        # NEW
         self.sig_pump_profile_start.connect(self.worker.cmd_start_pump_profile)
         self.sig_pump_profile_stop.connect(self.worker.cmd_stop_pump_profile)
+
+        # NEW valve macro
+        self.sig_valve_on.connect(self.worker.cmd_valve_on)
+        self.sig_valve_off.connect(self.worker.cmd_valve_off)
 
         self.worker_thread.start()
 
@@ -172,17 +176,11 @@ class MainWindow(QWidget):
 
         fig.tight_layout()
 
-        # tabs
-        self.tabs = QTabWidget()
-        self.tab_manual = QWidget()
-        self.tab_cycle = QWidget()
-        self.tabs.addTab(self.tab_manual, "Manual")
-        self.tabs.addTab(self.tab_cycle, "Cyclogram")
+        # UI panel
+        self.panel = QWidget()
+        self._build_manual_panel()
 
-        self._build_manual_tab()
-        self._build_cycle_tab()
-
-        # status row
+        # bottom status row
         self.lbl_stage = QLabel("stage: -")
         self.lbl_log = QLabel("log: -")
         self.lbl_error = QLabel("")
@@ -190,7 +188,7 @@ class MainWindow(QWidget):
 
         root = QVBoxLayout()
         root.addWidget(self.canvas, stretch=3)
-        root.addWidget(self.tabs, stretch=2)
+        root.addWidget(self.panel, stretch=2)
 
         st = QHBoxLayout()
         st.addWidget(self.lbl_stage)
@@ -203,17 +201,19 @@ class MainWindow(QWidget):
         self.setLayout(root)
         self.refresh_ports()
 
-    # ---------------- UI builders
     def _vesc_group(self, title: str, default_pp="3", default_duty="0.0", default_rpm="0", with_pump_profile=False):
         g = QGroupBox(title)
         l = QVBoxLayout()
 
+        rpm_style = "font-weight: bold; font-size: 24px;"
+
         row1 = QHBoxLayout()
         lamp = Lamp()
         cb = QComboBox()
+
         rpm_live = QLabel("0 rpm")
-        rpm_live.setStyleSheet("color: #c00000; font-weight: bold; font-size: 16px;")
-        rpm_live.setFixedWidth(120)
+        rpm_live.setStyleSheet(rpm_style)
+        rpm_live.setFixedWidth(170)
 
         row1.addWidget(QLabel("COM:"))
         row1.addWidget(cb)
@@ -251,7 +251,6 @@ class MainWindow(QWidget):
         btn_stop = QPushButton("Stop")
         row2.addWidget(btn_stop)
 
-        # Pump cyclogram controls in SAME ROW (no Loop, no extra Stop)
         prof_path = None
         prof_browse = None
         prof_start = None
@@ -262,7 +261,7 @@ class MainWindow(QWidget):
             prof_path = QLineEdit("")
             prof_path.setReadOnly(True)
             prof_path.setPlaceholderText("file.xlsx")
-            prof_path.setMinimumWidth(220)
+            prof_path.setMinimumWidth(240)
             row2.addWidget(prof_path)
 
             prof_browse = QPushButton("...")
@@ -282,24 +281,50 @@ class MainWindow(QWidget):
                     prof_path, prof_browse, prof_start)
         return (g, cb, lamp, rpm_live, pp, duty, rpm, btn_c, btn_d, btn_set_d, btn_set_r, btn_stop)
 
-    def _build_manual_tab(self):
+    def _build_manual_panel(self):
         layout = QVBoxLayout()
 
-        # Pump group with inline cyclogram controls
+        # Top session row
+        row = QHBoxLayout()
+        self.btn_ready = QPushButton("Ready")
+        self.btn_run = QPushButton("Run")
+        self.btn_cooling = QPushButton("Cooling")
+        self.in_cool_duty = QLineEdit("0.05")
+        self.in_cool_duty.setFixedWidth(80)
+        self.btn_update = QPushButton("Update")
+        self.btn_stop_all = QPushButton("Stop All")
+
+        row.addWidget(self.btn_ready)
+        row.addWidget(self.btn_run)
+        row.addWidget(self.btn_cooling)
+        row.addWidget(QLabel("Cooling duty:"))
+        row.addWidget(self.in_cool_duty)
+        row.addSpacing(15)
+        row.addWidget(self.btn_update)
+        row.addWidget(self.btn_stop_all)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        # Pump group
         (self.grp_pump, self.cb_pump, self.lamp_pump, self.lbl_pump_rpm_live, self.pp_pump,
          self.in_pump_duty, self.in_pump_rpm, self.btn_pump_c, self.btn_pump_d,
          self.btn_pump_set_d, self.btn_pump_set_r, self.btn_pump_stop,
          self.in_pump_prof_path, self.btn_pump_prof_browse, self.btn_pump_prof_start
          ) = self._vesc_group("Pump VESC", default_pp="7", default_duty="0.07", default_rpm="2600", with_pump_profile=True)
+        self.lbl_pump_rpm_live.setStyleSheet("color: red; font-weight: bold; font-size: 24px;")
 
+        # Starter group
         (self.grp_starter, self.cb_starter, self.lamp_starter, self.lbl_starter_rpm_live, self.pp_starter,
          self.in_starter_duty, self.in_starter_rpm, self.btn_starter_c, self.btn_starter_d,
          self.btn_starter_set_d, self.btn_starter_set_r, self.btn_starter_stop
          ) = self._vesc_group("Starter VESC", default_pp="3", default_duty="0.05", default_rpm="1000")
+        self.lbl_starter_rpm_live.setStyleSheet("color: blue; font-weight: bold; font-size: 24px;")
 
         # PSU group
         self.grp_psu = QGroupBox("PSU (RD6024)")
         lpsu = QVBoxLayout()
+
+        psu_style = "color: #c00000; font-weight: bold; font-size: 24px;"
 
         r1 = QHBoxLayout()
         self.cb_psu = QComboBox()
@@ -307,8 +332,8 @@ class MainWindow(QWidget):
         self.btn_psu_c = QPushButton("Connect")
         self.btn_psu_d = QPushButton("Disconnect")
         self.lbl_psu_live = QLabel("0.0V / 0.0A")
-        self.lbl_psu_live.setStyleSheet("color: #c00000; font-weight: bold; font-size: 16px;")
-        self.lbl_psu_live.setFixedWidth(160)
+        self.lbl_psu_live.setStyleSheet(psu_style)
+        self.lbl_psu_live.setFixedWidth(220)
 
         r1.addWidget(QLabel("COM:"))
         r1.addWidget(self.cb_psu)
@@ -321,11 +346,15 @@ class MainWindow(QWidget):
         lpsu.addLayout(r1)
 
         r2 = QHBoxLayout()
-        self.in_psu_v = QLineEdit("0.0")
+        self.in_psu_v = QLineEdit("0")
         self.in_psu_i = QLineEdit("20.0")
         self.btn_psu_set = QPushButton("Set V/I")
         self.btn_psu_on = QPushButton("Output ON")
         self.btn_psu_off = QPushButton("Output OFF")
+
+        # NEW valve macro buttons
+        self.btn_valve_on = QPushButton("On Valve")
+        self.btn_valve_off = QPushButton("Off Valve")
 
         r2.addWidget(QLabel("V:"))
         r2.addWidget(self.in_psu_v)
@@ -334,34 +363,36 @@ class MainWindow(QWidget):
         r2.addWidget(self.btn_psu_set)
         r2.addWidget(self.btn_psu_on)
         r2.addWidget(self.btn_psu_off)
+        r2.addSpacing(12)
+        r2.addWidget(self.btn_valve_on)
+        r2.addWidget(self.btn_valve_off)
         r2.addStretch(1)
         lpsu.addLayout(r2)
 
         self.grp_psu.setLayout(lpsu)
 
-        # session buttons
-        row = QHBoxLayout()
-        self.btn_ready = QPushButton("Ready")
-        self.btn_update = QPushButton("Update")
-        self.btn_stop_all = QPushButton("Stop All")
-        row.addWidget(self.btn_ready)
-        row.addWidget(self.btn_update)
-        row.addWidget(self.btn_stop_all)
-        row.addStretch(1)
-
-        layout.addLayout(row)
         layout.addWidget(self.grp_pump)
         layout.addWidget(self.grp_starter)
         layout.addWidget(self.grp_psu)
         layout.addStretch(1)
-        self.tab_manual.setLayout(layout)
+        self.panel.setLayout(layout)
 
-        # active groups
-        self._pump_mode_buttons = [self.btn_pump_set_d, self.btn_pump_set_r, self.btn_pump_stop]
-        self._starter_mode_buttons = [self.btn_starter_set_d, self.btn_starter_set_r, self.btn_starter_stop]
-        self._psu_output_buttons = [self.btn_psu_on, self.btn_psu_off]
+        # Wiring
+        self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
+        self.btn_update.clicked.connect(self._update_reset)
+        self.btn_stop_all.clicked.connect(self._stop_all_clicked)
 
-        # wiring
+        self.btn_run.clicked.connect(lambda: self.sig_run_cycle.emit())
+
+        def _cooling_click():
+            try:
+                d = float(self.in_cool_duty.text())
+            except Exception:
+                d = 0.05
+            self.sig_cooling.emit(d)
+
+        self.btn_cooling.clicked.connect(_cooling_click)
+
         self.btn_pump_c.clicked.connect(lambda: self.sig_connect_pump.emit(self.cb_pump.currentText()))
         self.btn_pump_d.clicked.connect(self.sig_disconnect_pump.emit)
         self.btn_pump_set_d.clicked.connect(self._set_pump_duty)
@@ -377,12 +408,12 @@ class MainWindow(QWidget):
         self.btn_psu_c.clicked.connect(lambda: self.sig_connect_psu.emit(self.cb_psu.currentText()))
         self.btn_psu_d.clicked.connect(self.sig_disconnect_psu.emit)
         self.btn_psu_set.clicked.connect(self._psu_set_vi)
-        self.btn_psu_on.clicked.connect(self._psu_on)
-        self.btn_psu_off.clicked.connect(self._psu_off)
+        self.btn_psu_on.clicked.connect(lambda: self.sig_psu_output.emit(True))
+        self.btn_psu_off.clicked.connect(lambda: self.sig_psu_output.emit(False))
 
-        self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
-        self.btn_update.clicked.connect(self._update_reset)
-        self.btn_stop_all.clicked.connect(self._stop_all_clicked)
+        # NEW valve macro wiring
+        self.btn_valve_on.clicked.connect(lambda: self.sig_valve_on.emit())
+        self.btn_valve_off.clicked.connect(lambda: self.sig_valve_off.emit())
 
         # Enter = click
         self.in_pump_duty.returnPressed.connect(self.btn_pump_set_d.click)
@@ -391,115 +422,11 @@ class MainWindow(QWidget):
         self.in_starter_rpm.returnPressed.connect(self.btn_starter_set_r.click)
         self.in_psu_v.returnPressed.connect(self.btn_psu_set.click)
         self.in_psu_i.returnPressed.connect(self.btn_psu_set.click)
+        self.in_cool_duty.returnPressed.connect(self.btn_cooling.click)
 
         # pump cyclogram (inline)
         self.btn_pump_prof_browse.clicked.connect(self._browse_pump_profile)
         self.btn_pump_prof_start.clicked.connect(self._start_pump_profile)
-
-        # default highlights
-        self._set_active_buttons(self._pump_mode_buttons, self.btn_pump_stop)
-        self._set_active_buttons(self._starter_mode_buttons, self.btn_starter_stop)
-        self._set_active_buttons(self._psu_output_buttons, self.btn_psu_off)
-
-    def _build_cycle_tab(self):
-        layout = QVBoxLayout()
-
-        row = QHBoxLayout()
-        self.btn_ready2 = QPushButton("Ready")
-        self.btn_run = QPushButton("Run")
-        self.btn_cooling = QPushButton("Cooling")
-        self.btn_stop2 = QPushButton("Stop")
-        self.btn_update2 = QPushButton("Update")
-        row.addWidget(self.btn_ready2)
-        row.addWidget(self.btn_run)
-        row.addWidget(self.btn_stop2)
-        row.addWidget(self.btn_cooling)
-        row.addWidget(self.btn_update2)
-        row.addStretch(1)
-        layout.addLayout(row)
-
-        gb_info = QGroupBox("Session")
-        li = QHBoxLayout()
-        self.in_product = QLineEdit("product_1")
-        self.lbl_cycle_stage = QLabel("stage: -")
-        li.addWidget(QLabel("product:"))
-        li.addWidget(self.in_product)
-        li.addSpacing(15)
-        li.addWidget(QLabel("status:"))
-        li.addWidget(self.lbl_cycle_stage)
-        li.addStretch(1)
-        gb_info.setLayout(li)
-        layout.addWidget(gb_info)
-
-        gb_live = QGroupBox("Live")
-        ll = QHBoxLayout()
-        self.lbl_c_pump = QLabel("Pump: 0 rpm")
-        self.lbl_c_pump.setStyleSheet("color: red; font-weight: bold; font-size: 16px;")
-        self.lbl_c_starter = QLabel("Starter: 0 rpm")
-        self.lbl_c_starter.setStyleSheet("color: blue; font-weight: bold; font-size: 16px;")
-        self.lbl_c_valve = QLabel("Valve: 0.0V / 0.0A")
-        self.lbl_c_valve.setStyleSheet("color: green; font-weight: bold; font-size: 16px;")
-        self.in_cool_duty = QLineEdit("0.05")
-        self.in_cool_duty.setFixedWidth(80)
-        ll.addWidget(self.lbl_c_pump)
-        ll.addSpacing(20)
-        ll.addWidget(self.lbl_c_starter)
-        ll.addSpacing(20)
-        ll.addWidget(self.lbl_c_valve)
-        ll.addStretch(1)
-        ll.addWidget(QLabel("Cooling duty:"))
-        ll.addWidget(self.in_cool_duty)
-        gb_live.setLayout(ll)
-        layout.addWidget(gb_live)
-
-        gb_ports = QGroupBox("Ports")
-        lp = QVBoxLayout()
-
-        def port_row(title: str):
-            r = QHBoxLayout()
-            cb = QComboBox()
-            lamp = Lamp()
-            b1 = QPushButton("Connect")
-            b2 = QPushButton("Disconnect")
-            r.addWidget(QLabel(title))
-            r.addWidget(cb)
-            r.addWidget(lamp)
-            r.addWidget(b1)
-            r.addWidget(b2)
-            r.addStretch(1)
-            lp.addLayout(r)
-            return cb, lamp, b1, b2
-
-        self.cb_pump2, self.lamp_pump2, self.btn_pump2_c, self.btn_pump2_d = port_row("Pump VESC:")
-        self.cb_starter2, self.lamp_starter2, self.btn_starter2_c, self.btn_starter2_d = port_row("Starter VESC:")
-        self.cb_psu2, self.lamp_psu2, self.btn_psu2_c, self.btn_psu2_d = port_row("PSU:")
-
-        gb_ports.setLayout(lp)
-        layout.addWidget(gb_ports)
-
-        layout.addStretch(1)
-        self.tab_cycle.setLayout(layout)
-
-        self.btn_ready2.clicked.connect(lambda: self.sig_ready.emit(self.in_product.text().strip() or "cycle"))
-        self.btn_run.clicked.connect(lambda: self.sig_run_cycle.emit())
-
-        def _cooling_click():
-            try:
-                d = float(self.in_cool_duty.text())
-            except Exception:
-                d = 0.05
-            self.sig_cooling.emit(d)
-
-        self.btn_cooling.clicked.connect(_cooling_click)
-        self.btn_stop2.clicked.connect(self._stop_all_clicked)
-        self.btn_update2.clicked.connect(self._update_reset)
-
-        self.btn_pump2_c.clicked.connect(lambda: self.sig_connect_pump.emit(self.cb_pump2.currentText()))
-        self.btn_pump2_d.clicked.connect(lambda: self.sig_disconnect_pump.emit())
-        self.btn_starter2_c.clicked.connect(lambda: self.sig_connect_starter.emit(self.cb_starter2.currentText()))
-        self.btn_starter2_d.clicked.connect(lambda: self.sig_disconnect_starter.emit())
-        self.btn_psu2_c.clicked.connect(lambda: self.sig_connect_psu.emit(self.cb_psu2.currentText()))
-        self.btn_psu2_d.clicked.connect(lambda: self.sig_disconnect_psu.emit())
 
     # ---------------- pump profile UI
     def _browse_pump_profile(self):
@@ -519,13 +446,7 @@ class MainWindow(QWidget):
     # ---------------- actions
     def refresh_ports(self):
         ports = self.worker.list_ports()
-
-        combos = [self.cb_pump, self.cb_starter, self.cb_psu]
-        for name in ("cb_pump2", "cb_starter2", "cb_psu2"):
-            if hasattr(self, name):
-                combos.append(getattr(self, name))
-
-        def refill(cb: QComboBox):
+        for cb in (self.cb_pump, self.cb_starter, self.cb_psu):
             prev = cb.currentText()
             cb.blockSignals(True)
             cb.clear()
@@ -533,9 +454,6 @@ class MainWindow(QWidget):
             if prev in ports:
                 cb.setCurrentText(prev)
             cb.blockSignals(False)
-
-        for cb in combos:
-            refill(cb)
 
     def _apply_pole_pairs(self):
         try:
@@ -553,7 +471,6 @@ class MainWindow(QWidget):
         self._apply_pole_pairs()
         try:
             self.sig_set_pump_duty.emit(float(self.in_pump_duty.text()))
-            self._set_active_buttons(self._pump_mode_buttons, self.btn_pump_set_d)
         except Exception:
             pass
 
@@ -561,7 +478,6 @@ class MainWindow(QWidget):
         self._apply_pole_pairs()
         try:
             self.sig_set_pump_rpm.emit(float(self.in_pump_rpm.text()))
-            self._set_active_buttons(self._pump_mode_buttons, self.btn_pump_set_r)
         except Exception:
             pass
 
@@ -569,7 +485,6 @@ class MainWindow(QWidget):
         self._apply_pole_pairs()
         try:
             self.sig_set_starter_duty.emit(float(self.in_starter_duty.text()))
-            self._set_active_buttons(self._starter_mode_buttons, self.btn_starter_set_d)
         except Exception:
             pass
 
@@ -577,7 +492,6 @@ class MainWindow(QWidget):
         self._apply_pole_pairs()
         try:
             self.sig_set_starter_rpm.emit(float(self.in_starter_rpm.text()))
-            self._set_active_buttons(self._starter_mode_buttons, self.btn_starter_set_r)
         except Exception:
             pass
 
@@ -588,29 +502,16 @@ class MainWindow(QWidget):
             pass
 
     def _pump_stop(self):
-        # stop pump profile too
         self.sig_pump_profile_stop.emit()
         self.sig_set_pump_duty.emit(0.0)
-        self._set_active_buttons(self._pump_mode_buttons, self.btn_pump_stop)
 
     def _starter_stop(self):
         self.sig_set_starter_duty.emit(0.0)
-        self._set_active_buttons(self._starter_mode_buttons, self.btn_starter_stop)
-
-    def _psu_on(self):
-        self.sig_psu_output.emit(True)
-        self._set_active_buttons(self._psu_output_buttons, self.btn_psu_on)
-
-    def _psu_off(self):
-        self.sig_psu_output.emit(False)
-        self._set_active_buttons(self._psu_output_buttons, self.btn_psu_off)
 
     def _stop_all_clicked(self):
         self.sig_pump_profile_stop.emit()
+        self.sig_valve_off.emit()
         self.sig_stop_all.emit()
-        self._set_active_buttons(self._pump_mode_buttons, self.btn_pump_stop)
-        self._set_active_buttons(self._starter_mode_buttons, self.btn_starter_stop)
-        self._set_active_buttons(self._psu_output_buttons, self.btn_psu_off)
 
     def _update_reset(self):
         self.sig_update_reset.emit()
@@ -627,7 +528,6 @@ class MainWindow(QWidget):
         t = float(s.get("t", 0.0))
         stage = s.get("stage", "-")
         self.lbl_stage.setText(f"stage: {stage}")
-        self.lbl_cycle_stage.setText(f"stage: {stage}")
 
         pump = s.get("pump", {})
         starter = s.get("starter", {})
@@ -644,19 +544,16 @@ class MainWindow(QWidget):
         self.psu_v.append(float(psu.get("v_out", 0.0)))
         self.psu_i.append(float(psu.get("i_out", 0.0)))
 
-        self.lbl_pump_rpm_live.setText(f"{self.pump_rpm[-1]:.0f} rpm")
-        self.lbl_starter_rpm_live.setText(f"{self.starter_rpm[-1]:.0f} rpm")
-        self.lbl_psu_live.setText(f"{self.psu_v[-1]:.1f}V / {self.psu_i[-1]:.2f}A")
-
-        self.lbl_c_pump.setText(f"Pump: {self.pump_rpm[-1]:.0f} rpm")
-        self.lbl_c_starter.setText(f"Starter: {self.starter_rpm[-1]:.0f} rpm")
-        self.lbl_c_valve.setText(f"Valve: {self.psu_v[-1]:.1f}V / {self.psu_i[-1]:.2f}A")
-
         # visible window
         WINDOW_S = 30.0
         while self.t and (self.t[-1] - self.t[0] > WINDOW_S):
-            for arr in (self.t, self.stage, self.pump_rpm, self.starter_rpm, self.pump_duty, self.starter_duty,
-                        self.pump_cur, self.starter_cur, self.psu_v, self.psu_i):
+            for arr in (
+                self.t, self.stage,
+                self.pump_rpm, self.starter_rpm,
+                self.pump_duty, self.starter_duty,
+                self.pump_cur, self.starter_cur,
+                self.psu_v, self.psu_i
+            ):
                 arr.pop(0)
 
         self._plot_dirty = True
@@ -703,49 +600,20 @@ class MainWindow(QWidget):
 
         if "connected" in st:
             c = st["connected"]
-            pump_on = bool(c.get("pump", False))
-            starter_on = bool(c.get("starter", False))
-            psu_on = bool(c.get("psu", False))
+            self.lamp_pump.set_on(bool(c.get("pump", False)))
+            self.lamp_starter.set_on(bool(c.get("starter", False)))
+            self.lamp_psu.set_on(bool(c.get("psu", False)))
 
-            self.lamp_pump.set_on(pump_on)
-            self.lamp_starter.set_on(starter_on)
-            self.lamp_psu.set_on(psu_on)
-
-            if hasattr(self, "lamp_pump2"):
-                self.lamp_pump2.set_on(pump_on)
-                self.lamp_starter2.set_on(starter_on)
-                self.lamp_psu2.set_on(psu_on)
-
-        # Pump profile active highlight
-        if "pump_profile" in st:
-            p = st["pump_profile"] or {}
-            active = bool(p.get("active", False))
-            self.btn_pump_prof_start.setProperty("active", active)
-            self.btn_pump_prof_start.style().unpolish(self.btn_pump_prof_start)
-            self.btn_pump_prof_start.style().polish(self.btn_pump_prof_start)
-            self.btn_pump_prof_start.update()
-
-            # disable browse/start while running
-            self.btn_pump_prof_start.setEnabled(not active)
-            self.btn_pump_prof_browse.setEnabled(not active)
-
-            # show selected filename if any
-            path = p.get("path") or ""
-            if path and not self.in_pump_prof_path.text():
-                self.in_pump_prof_path.setText(path)
+        # Valve macro highlight
+        if "valve_macro" in st:
+            active = bool((st["valve_macro"] or {}).get("active", False))
+            self.btn_valve_on.setProperty("active", active)
+            self.btn_valve_on.style().unpolish(self.btn_valve_on)
+            self.btn_valve_on.style().polish(self.btn_valve_on)
+            self.btn_valve_on.update()
 
     def on_error(self, msg: str):
         self.lbl_error.setText(msg)
-
-    def on_log(self, msg: str):
-        pass
-
-    def _set_active_buttons(self, buttons, active_btn=None):
-        for b in buttons:
-            b.setProperty("active", (b is active_btn))
-            b.style().unpolish(b)
-            b.style().polish(b)
-            b.update()
 
     def closeEvent(self, event):
         try:
