@@ -21,10 +21,10 @@ class StartupConfig:
 
     # --- Ignition
     ignition_timeout_s: float = 20.0
-    valve_v1: float = 18.0
-    valve_v2: float = 24.0
-    valve_i: float = 5.0
-    valve_switch_s: float = 1.0
+    valve_v1: float = 12.0
+    valve_v2: float = 5.0
+    valve_i: float = 20.0
+    valve_switch_s: float = 1.5
 
     # стартер під час Ignition: маленька циклограма duty
     starter_duty_profile_ign: List[Tuple[float, float]] = None
