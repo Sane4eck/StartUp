@@ -14,7 +14,6 @@ from devices_psu_riden import RidenPSU
 from logger_csv import CSVLogger
 
 from pump_profile import load_pump_profile_xlsx, interp_profile, PumpProfile
-
 from cycle_fsm import CycleInputs, CycleFSM
 from cyclogram_startup import build_startup_fsm, StartupConfig, build_cooling_fsm
 
@@ -101,6 +100,16 @@ class ControllerWorker(QObject):
         self._pump_prof_t0: float = 0.0
         self._pump_prof_prev_stage: str = "idle"
 
+        # ---------------- Valve macro (NEW)
+        # On Valve: 18V/20A for 1s, then 5V/20A hold until Off Valve.
+        self._valve_macro_active: bool = False
+        self._valve_macro_t0: float = 0.0
+        self._valve_boost_v: float = 18.0
+        self._valve_boost_i: float = 20.0
+        self._valve_boost_s: float = 1.0
+        self._valve_hold_v: float = 5.0
+        self._valve_hold_i: float = 20.0
+
     @staticmethod
     def list_ports() -> list[str]:
         return [p.device for p in serial.tools.list_ports.comports()]
@@ -122,6 +131,8 @@ class ControllerWorker(QObject):
 
         self._fsm = None
         self._stop_pump_profile_internal()
+        self._valve_macro_active = False
+
         self.stage = "stop"
         self._force_all_off()
 
@@ -178,6 +189,7 @@ class ControllerWorker(QObject):
     @pyqtSlot()
     def cmd_run_cycle(self) -> None:
         self._stop_pump_profile_internal()
+        self._valve_macro_active = False  # cycle owns valve
 
         if not self._ensure_run_profiles():
             return
@@ -185,8 +197,6 @@ class ControllerWorker(QObject):
         now = time.time()
         inp = self._make_inputs(now)
 
-        # FuelRamp uses two profiles:
-        # pump_profile: RPM, starter_profile: DUTY
         self._fsm = build_startup_fsm(self._pump_profile, self._starter_profile, self.startup_cfg)
         self._fsm_prev_state = None
         self._fsm.start(inp)
@@ -196,6 +206,7 @@ class ControllerWorker(QObject):
     @pyqtSlot(float)
     def cmd_cooling_cycle(self, duty: float) -> None:
         self._stop_pump_profile_internal()
+        self._valve_macro_active = False  # cooling owns valve
 
         now = time.time()
         inp = self._make_inputs(now)
@@ -210,8 +221,30 @@ class ControllerWorker(QObject):
     def cmd_stop_all(self) -> None:
         self._fsm = None
         self._stop_pump_profile_internal()
+        self._valve_macro_active = False
         self.stage = "stop"
         self._force_all_off()
+        self._emit_connected()
+
+    # ---------------- Valve macro commands (NEW)
+    @pyqtSlot()
+    def cmd_valve_on(self) -> None:
+        if not self.psu.is_connected:
+            self.error.emit("Valve: PSU not connected")
+            return
+
+        # cancel cyclogram (to avoid conflicts with valve control)
+        self._fsm = None
+
+        self._valve_macro_active = True
+        self._valve_macro_t0 = time.time()
+        self._set_psu_target(self._valve_boost_v, self._valve_boost_i, True)
+        self._emit_connected()
+
+    @pyqtSlot()
+    def cmd_valve_off(self) -> None:
+        self._valve_macro_active = False
+        self._set_psu_target(0.0, 0.0, False)
         self._emit_connected()
 
     # ---------------- Manual pump profile (Manual tab)
@@ -315,6 +348,7 @@ class ControllerWorker(QObject):
     @pyqtSlot()
     def cmd_disconnect_psu(self) -> None:
         self._stop_pump_profile_internal()
+        self._valve_macro_active = False
         self._set_psu_target(0.0, 0.0, False)
         self._disconnect_psu()
         self._emit_connected()
@@ -359,17 +393,19 @@ class ControllerWorker(QObject):
         self._fsm = None
         self.starter_target = {"mode": "rpm", "value": float(rpm)}
 
-    # ---------------- PSU manual
+    # ---------------- PSU manual (manual actions cancel valve macro)
     @pyqtSlot(float, float)
     def cmd_psu_set_vi(self, v: float, i: float) -> None:
         self._stop_pump_profile_internal()
         self._fsm = None
+        self._valve_macro_active = False
         self._set_psu_target(float(v), float(i), bool(self.psu_target.get("out", False)))
 
     @pyqtSlot(bool)
     def cmd_psu_output(self, on: bool) -> None:
         self._stop_pump_profile_internal()
         self._fsm = None
+        self._valve_macro_active = False
         self._set_psu_target(float(self.psu_target.get("v", 0.0)), float(self.psu_target.get("i", 0.0)), bool(on))
 
     # ---------------- helpers
@@ -385,6 +421,9 @@ class ControllerWorker(QObject):
             "pump_profile": {
                 "active": self._pump_prof_active,
                 "path": self._pump_prof_path,
+            },
+            "valve_macro": {
+                "active": self._valve_macro_active,
             }
         })
 
@@ -432,7 +471,6 @@ class ControllerWorker(QObject):
         self._psu_next_cmd = 0.0
 
     def _ensure_run_profiles(self) -> bool:
-        # load pump profile
         try:
             base = os.path.dirname(os.path.abspath(__file__))
 
@@ -453,7 +491,6 @@ class ControllerWorker(QObject):
                 raise RuntimeError("starter profile empty")
 
             return True
-
         except Exception as e:
             self.error.emit(f"Cannot load run profiles: {e}")
             return False
@@ -533,8 +570,13 @@ class ControllerWorker(QObject):
                 self.starter_target = targets.starter
                 self._set_psu_target(targets.psu["v"], targets.psu["i"], targets.psu["out"])
 
-                # NOTE: Running is infinite, so FSM will not auto-stop.
-                # It stops only when user presses Stop (cmd_stop_all) or manual overrides cancel FSM.
+            # Valve macro overrides PSU (only if active and no cyclogram)
+            if self._fsm is None and self._valve_macro_active:
+                elapsed = now - self._valve_macro_t0
+                if elapsed < self._valve_boost_s:
+                    self._set_psu_target(self._valve_boost_v, self._valve_boost_i, True)
+                else:
+                    self._set_psu_target(self._valve_hold_v, self._valve_hold_i, True)
 
             # PSU apply only changed
             if self.psu.is_connected and self._psu_dirty and now >= self._psu_next_cmd:
