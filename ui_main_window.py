@@ -321,8 +321,8 @@ class MainWindow(QWidget):
         lpsu.addLayout(r1)
 
         r2 = QHBoxLayout()
-        self.in_psu_v = QLineEdit("24.0")
-        self.in_psu_i = QLineEdit("5.0")
+        self.in_psu_v = QLineEdit("0.0")
+        self.in_psu_i = QLineEdit("20.0")
         self.btn_psu_set = QPushButton("Set V/I")
         self.btn_psu_on = QPushButton("Output ON")
         self.btn_psu_off = QPushButton("Output OFF")
