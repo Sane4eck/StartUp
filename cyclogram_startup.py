@@ -24,8 +24,8 @@ from pump_profile import PumpProfile, interp_profile
 class StartupConfig:
     # -------- Starter
     starter_duty_start: float = 0.055
-    starter_timeout_s: float = 10.0
-    starter_min_rpm: float = 500.0
+    starter_timeout_s: float = 15.0
+    starter_min_rpm: float = 900.0
     starter_min_hold_s: float = 0.2
 
     # -------- Valve behavior in FuelRamp (твоя вимога)
@@ -40,7 +40,7 @@ class StartupConfig:
     # Перехід FuelRamp->Running: закінчення профілю насоса (див. pump_profile_done)
 
     # -------- Running (нескінченний)
-    running_starter_use_const: bool = False
+    running_starter_use_const: bool = True
     running_starter_duty_const: float = 0.00
 
 
