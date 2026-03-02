@@ -19,8 +19,11 @@ from cyclogram_startup import build_startup_fsm, StartupConfig, build_cooling_fs
 
 
 # Run-cycle profiles:
-PUMP_PROFILE_XLSX = "_Cyclogram_Pump_test.xlsx"
-STARTER_PROFILE_XLSX = "_Cyclogram_Starter_test.xlsx"
+# PUMP_PROFILE_XLSX = "_Cyclogram_Pump_test.xlsx"
+# STARTER_PROFILE_XLSX = "_Cyclogram_Starter_test.xlsx"
+
+PUMP_PROFILE_XLSX = "_Cyclogram_Pump.xlsx"
+STARTER_PROFILE_XLSX = "_Cyclogram_Starter.xlsx"
 
 
 def _clamp01(x: float) -> float:
