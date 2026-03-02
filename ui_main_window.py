@@ -6,7 +6,7 @@ import time
 from PyQt5.QtCore import QTimer, pyqtSignal, Qt, QThread, QMetaObject
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QLineEdit,
-    QGroupBox, QSizePolicy, QFileDialog
+    QGroupBox, QSizePolicy, QFileDialog, QCheckBox
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
 from matplotlib.figure import Figure
@@ -63,10 +63,15 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Dual VESC + PSU (Manual)")
 
-        # active button highlight
+        # style (active + danger)
         self.setStyleSheet(self.styleSheet() + """
         QPushButton[active="true"] {
             background-color: #2d6cdf;
+            color: white;
+            font-weight: bold;
+        }
+        QPushButton[danger="true"] {
+            background-color: #c00000;
             color: white;
             font-weight: bold;
         }
@@ -125,9 +130,9 @@ class MainWindow(QWidget):
 
         self.worker_thread.start()
 
-        # port refresh timer (повільніше і тільки коли НЕ підключено)
+        # ports timer (тільки якщо Auto ports = ON)
         self.port_timer = QTimer(self)
-        self.port_timer.timeout.connect(self.refresh_ports)
+        self.port_timer.timeout.connect(lambda: self.refresh_ports(force=False))
         self.port_timer.start(1500)
 
         # buffers
@@ -205,7 +210,13 @@ class MainWindow(QWidget):
         root.addLayout(st)
 
         self.setLayout(root)
-        self.refresh_ports()
+
+        self.refresh_ports(force=True)
+
+    def _apply_style(self, btn: QPushButton):
+        btn.style().unpolish(btn)
+        btn.style().polish(btn)
+        btn.update()
 
     def _vesc_group(self, title: str, default_pp="3", default_duty="0.0", default_rpm="0", with_pump_profile=False):
         g = QGroupBox(title)
@@ -255,6 +266,8 @@ class MainWindow(QWidget):
         row2.addWidget(btn_set_r)
 
         btn_stop = QPushButton("Stop")
+        btn_stop.setProperty("danger", False)
+        self._apply_style(btn_stop)
         row2.addWidget(btn_stop)
 
         prof_path = None
@@ -290,7 +303,7 @@ class MainWindow(QWidget):
     def _build_manual_panel(self):
         layout = QVBoxLayout()
 
-        # Top session row
+        # Top session row + ports refresh controls
         row = QHBoxLayout()
         self.btn_ready = QPushButton("Ready")
         self.btn_run = QPushButton("Run")
@@ -299,6 +312,13 @@ class MainWindow(QWidget):
         self.in_cool_duty.setFixedWidth(80)
         self.btn_update = QPushButton("Update")
         self.btn_stop_all = QPushButton("Stop All")
+        self.btn_stop_all.setProperty("danger", True)
+        self._apply_style(self.btn_stop_all)
+
+        # NEW ports controls
+        self.btn_refresh_ports = QPushButton("Refresh ports")
+        self.chk_auto_ports = QCheckBox("Auto ports")
+        self.chk_auto_ports.setChecked(False)  # за замовчуванням вимкнено
 
         row.addWidget(self.btn_ready)
         row.addWidget(self.btn_run)
@@ -308,6 +328,9 @@ class MainWindow(QWidget):
         row.addSpacing(15)
         row.addWidget(self.btn_update)
         row.addWidget(self.btn_stop_all)
+        row.addSpacing(15)
+        row.addWidget(self.btn_refresh_ports)
+        row.addWidget(self.chk_auto_ports)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -356,9 +379,13 @@ class MainWindow(QWidget):
         self.btn_psu_set = QPushButton("Set V/I")
         self.btn_psu_on = QPushButton("Output ON")
         self.btn_psu_off = QPushButton("Output OFF")
+        self.btn_psu_off.setProperty("danger", False)
+        self._apply_style(self.btn_psu_off)
 
         self.btn_valve_on = QPushButton("On Valve")
         self.btn_valve_off = QPushButton("Off Valve")
+        self.btn_valve_off.setProperty("danger", False)
+        self._apply_style(self.btn_valve_off)
 
         r2.addWidget(QLabel("V:"))
         r2.addWidget(self.in_psu_v)
@@ -390,10 +417,12 @@ class MainWindow(QWidget):
         # Wiring (with highlight)
         self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
         self.btn_update.clicked.connect(self._update_reset)
-
         self.btn_run.clicked.connect(self._run_clicked)
         self.btn_cooling.clicked.connect(self._cooling_clicked)
         self.btn_stop_all.clicked.connect(self._stop_all_clicked)
+
+        self.btn_refresh_ports.clicked.connect(lambda: self.refresh_ports(force=True))
+        self.chk_auto_ports.toggled.connect(lambda _: self.refresh_ports(force=False))
 
         self.btn_pump_c.clicked.connect(lambda: self.sig_connect_pump.emit(self.cb_pump.currentText()))
         self.btn_pump_d.clicked.connect(self.sig_disconnect_pump.emit)
@@ -410,7 +439,6 @@ class MainWindow(QWidget):
         self.btn_psu_c.clicked.connect(lambda: self.sig_connect_psu.emit(self.cb_psu.currentText()))
         self.btn_psu_d.clicked.connect(self.sig_disconnect_psu.emit)
         self.btn_psu_set.clicked.connect(self._psu_set_vi)
-
         self.btn_psu_on.clicked.connect(self._psu_on)
         self.btn_psu_off.clicked.connect(self._psu_off)
 
@@ -479,23 +507,32 @@ class MainWindow(QWidget):
     def _start_pump_profile(self):
         path = self.in_pump_prof_path.text().strip()
         self.sig_pump_profile_start.emit(path)
-        # підсвітка старту профілю робиться по статусу (pump_profile.active)
+        # active highlight робиться по статусу pump_profile.active
 
-    # ---- actions
-    def refresh_ports(self):
-        # ВАЖЛИВО: не сканувати порти, коли хоч щось підключено (прибирає UI-frozen)
-        if self._any_connected:
+    # ---- ports refresh (manual / auto)
+    def refresh_ports(self, force: bool = False):
+        auto = bool(self.chk_auto_ports.isChecked()) if hasattr(self, "chk_auto_ports") else False
+        if not force and not auto:
+            return
+
+        # авто-скан не робимо під час підключення (щоб не фрізило)
+        if not force and self._any_connected:
             return
 
         ports = self.worker.list_ports()
+
+        def merge_ports(cb: QComboBox, new_ports: list[str]):
+            current = cb.currentText()
+            existing = {cb.itemText(i) for i in range(cb.count())}
+            for p in new_ports:
+                if p not in existing:
+                    cb.addItem(p)
+            # не видаляємо старі елементи — щоб підключені порти “не пропадали”
+            if current:
+                cb.setCurrentText(current)
+
         for cb in (self.cb_pump, self.cb_starter, self.cb_psu):
-            prev = cb.currentText()
-            cb.blockSignals(True)
-            cb.clear()
-            cb.addItems(ports)
-            if prev in ports:
-                cb.setCurrentText(prev)
-            cb.blockSignals(False)
+            merge_ports(cb, ports)
 
     def _apply_pole_pairs(self):
         try:
@@ -561,7 +598,6 @@ class MainWindow(QWidget):
         self.sig_valve_off.emit()
         self.sig_stop_all.emit()
 
-        # reset highlights
         self._set_active_buttons(self._pump_btns, self.btn_pump_stop)
         self._set_active_buttons(self._starter_btns, self.btn_starter_stop)
         self._set_active_buttons(self._psu_out_btns, self.btn_psu_off)
@@ -571,15 +607,20 @@ class MainWindow(QWidget):
     def _update_reset(self):
         self.sig_update_reset.emit()
         self.t.clear()
-        self.pump_rpm.clear(); self.starter_rpm.clear()
-        self.pump_duty.clear(); self.starter_duty.clear()
-        self.pump_cur.clear(); self.starter_cur.clear()
-        self.psu_v.clear(); self.psu_i.clear()
+        self.pump_rpm.clear()
+        self.starter_rpm.clear()
+        self.pump_duty.clear()
+        self.starter_duty.clear()
+        self.pump_cur.clear()
+        self.starter_cur.clear()
+        self.psu_v.clear()
+        self.psu_i.clear()
         self.stage.clear()
         self._redraw(force_autoscale=True)
 
     # ---------------- plot update
     def on_sample(self, s: dict):
+        # IMPORTANT: тут тепер оновлюються числові лейбли (інакше завжди 0)
         t = float(s.get("t", 0.0))
         stage = s.get("stage", "-")
         self.lbl_stage.setText(f"stage: {stage}")
@@ -588,18 +629,26 @@ class MainWindow(QWidget):
         starter = s.get("starter", {})
         psu = s.get("psu", {})
 
+        prpm = float(pump.get("rpm_mech", 0.0))
+        srpm = float(starter.get("rpm_mech", 0.0))
+        pv = float(psu.get("v_out", 0.0))
+        pi = float(psu.get("i_out", 0.0))
+
+        self.lbl_pump_rpm_live.setText(f"{prpm:.0f} rpm")
+        self.lbl_starter_rpm_live.setText(f"{srpm:.0f} rpm")
+        self.lbl_psu_live.setText(f"{pv:.1f}V / {pi:.2f}A")
+
         self.t.append(t)
         self.stage.append(stage)
-        self.pump_rpm.append(float(pump.get("rpm_mech", 0.0)))
-        self.starter_rpm.append(float(starter.get("rpm_mech", 0.0)))
+        self.pump_rpm.append(prpm)
+        self.starter_rpm.append(srpm)
         self.pump_duty.append(float(pump.get("duty", 0.0)))
         self.starter_duty.append(float(starter.get("duty", 0.0)))
         self.pump_cur.append(float(pump.get("current_motor", 0.0)))
         self.starter_cur.append(float(starter.get("current_motor", 0.0)))
-        self.psu_v.append(float(psu.get("v_out", 0.0)))
-        self.psu_i.append(float(psu.get("i_out", 0.0)))
+        self.psu_v.append(pv)
+        self.psu_i.append(pi)
 
-        # visible window
         WINDOW_S = 30.0
         while self.t and (self.t[-1] - self.t[0] > WINDOW_S):
             for arr in (
@@ -632,7 +681,6 @@ class MainWindow(QWidget):
         self.ax.set_xlim(tmin, tmax)
         self.ax_psu.set_xlim(tmin, tmax)
 
-        # ВАЖЛИВО: autoscale/relim робимо рідко (≈1 Гц), це сильно зменшує лаг
         now = time.time()
         if force_autoscale or (now - self._last_autoscale_ts >= 1.0):
             self._last_autoscale_ts = now
@@ -671,9 +719,7 @@ class MainWindow(QWidget):
             p = st["pump_profile"] or {}
             active = bool(p.get("active", False))
             self.btn_pump_prof_start.setProperty("active", active)
-            self.btn_pump_prof_start.style().unpolish(self.btn_pump_prof_start)
-            self.btn_pump_prof_start.style().polish(self.btn_pump_prof_start)
-            self.btn_pump_prof_start.update()
+            self._apply_style(self.btn_pump_prof_start)
             self.btn_pump_prof_start.setEnabled(not active)
             self.btn_pump_prof_browse.setEnabled(not active)
 
@@ -688,9 +734,7 @@ class MainWindow(QWidget):
     def _set_active_buttons(self, buttons, active_btn=None):
         for b in buttons:
             b.setProperty("active", (b is active_btn))
-            b.style().unpolish(b)
-            b.style().polish(b)
-            b.update()
+            self._apply_style(b)
 
     def closeEvent(self, event):
         try:
