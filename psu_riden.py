@@ -24,3 +24,4 @@ class RidenPSU:
             "ovp_ocp": self.dev.ovp_ocp,  # "OVP"/"OCP"/None
             "v_in": self.dev.v_in,
         }
+
