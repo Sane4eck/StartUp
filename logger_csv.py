@@ -50,3 +50,4 @@ class CSVLogger:
             self.f = None
             self.w = None
             self.path = None
+            
