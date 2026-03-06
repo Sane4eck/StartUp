@@ -24,7 +24,7 @@ from pump_profile import PumpProfile, interp_profile
 class StartupConfig:
     # -------- Starter
     starter_duty_start: float = 0.055
-    starter_timeout_s: float = 15.0
+    starter_timeout_s: float = 50.0
     starter_min_rpm: float = 900.0
     starter_min_hold_s: float = 0.2
 
@@ -33,7 +33,7 @@ class StartupConfig:
     valve_v_high: float = 18.0        # перші 1 секунди
     valve_high_time_s: float = 2.0
     valve_v_hold: float = 5.0         # після 1с до порогу rpm
-    valve_rpm_threshold: float = 21000.0  # після досягнення -> 0V/off
+    valve_rpm_threshold: float = 15000.0  # після досягнення -> 0V/off
 
     # -------- FuelRamp
     fuelramp_timeout_s: float = 120.0  # safety таймаут
