@@ -2,23 +2,41 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 import serial
-from serial import SerialException
-
 from pyvesc import encode, encode_request, decode
 from pyvesc.VESC.messages import SetDutyCycle, SetRPM, GetValues
+
+
+def _msg_to_dict(msg: Any) -> Dict[str, Any]:
+    """
+    Витягує всі JSON-сумісні поля з GetValues.
+    """
+    out: Dict[str, Any] = {}
+    for name in dir(msg):
+        if name.startswith("_"):
+            continue
+        try:
+            val = getattr(msg, name)
+        except Exception:
+            continue
+        if callable(val):
+            continue
+        if isinstance(val, (int, float, bool, str)) or val is None:
+            out[name] = val
+        elif isinstance(val, (list, tuple)) and all(isinstance(x, (int, float, bool)) for x in val):
+            out[name] = list(val)
+    return out
 
 
 @dataclass
 class VESCValues:
     rpm_mech: float = 0.0
-    erpm: float = 0.0
     duty: float = 0.0
     current_motor: float = 0.0
-    v_in: float = 0.0
+    raw: Dict[str, Any] = field(default_factory=dict)  # всі поля GetValues
 
 
 class VESCDevice:
@@ -35,12 +53,7 @@ class VESCDevice:
 
     def connect(self, port: str) -> None:
         self.disconnect()
-        self.ser = serial.Serial(
-            port=port,
-            baudrate=self.baudrate,
-            timeout=self.timeout,
-            write_timeout=0.2,
-        )
+        self.ser = serial.Serial(port=port, baudrate=self.baudrate, timeout=self.timeout, write_timeout=0.2)
         self.port = port
         try:
             self.ser.reset_input_buffer()
@@ -105,16 +118,17 @@ class VESCDevice:
                 self._rxbuf = self._rxbuf[consumed:]
 
             if isinstance(msg, GetValues):
-                erpm = float(getattr(msg, "rpm", 0.0))
-                duty = float(getattr(msg, "duty_cycle_now", 0.0))
-                current = float(getattr(msg, "avg_motor_current", 0.0))
-                v_in = float(getattr(msg, "v_in", 0.0))
+                raw = _msg_to_dict(msg)
+
+                erpm = float(raw.get("rpm", 0.0) or 0.0)  # GetValues.rpm = ERPM
+                duty = float(raw.get("duty_cycle_now", 0.0) or 0.0)
+                current = float(raw.get("avg_motor_current", 0.0) or 0.0)
+
                 return VESCValues(
                     rpm_mech=erpm / pp,
-                    erpm=erpm,
                     duty=duty,
                     current_motor=current,
-                    v_in=v_in,
+                    raw=raw,
                 )
 
             if len(self._rxbuf) > 4096:
