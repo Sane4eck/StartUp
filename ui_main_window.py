@@ -388,7 +388,8 @@ class MainWindow(QWidget):
         self._valve_btns = [self.btn_valve_on, self.btn_valve_off]
 
         # Wiring (with highlight)
-        self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
+        # self.btn_ready.clicked.connect(lambda: self.sig_ready.emit("manual"))
+        self.btn_ready.clicked.connect(self._ready_clicked)
         self.btn_update.clicked.connect(self._update_reset)
         self.btn_run.clicked.connect(self._run_clicked)
         self.btn_cooling.clicked.connect(self._cooling_clicked)
@@ -574,8 +575,7 @@ class MainWindow(QWidget):
         self._set_active_buttons(self._valve_btns, self.btn_valve_off)
         self._set_active_buttons([self.btn_run, self.btn_cooling], None)
 
-    def _update_reset(self):
-        self.sig_update_reset.emit()
+    def _clear_plot_buffers(self):
         self.t.clear()
         self.pump_rpm.clear()
         self.starter_rpm.clear()
@@ -587,6 +587,15 @@ class MainWindow(QWidget):
         self.psu_i.clear()
         self.stage.clear()
         self._redraw(force_autoscale=True)
+
+    def _ready_clicked(self):
+        self.sig_ready.emit("manual")
+        self._clear_plot_buffers()
+        self.lbl_error.setText("")
+
+    def _update_reset(self):
+        self.sig_update_reset.emit()
+        self._clear_plot_buffers()
 
     # ---------------- plot update
     def on_sample(self, s: dict):
@@ -611,8 +620,8 @@ class MainWindow(QWidget):
         self.stage.append(stage)
         self.pump_rpm.append(prpm)
         self.starter_rpm.append(srpm)
-        self.pump_duty.append(float(pump.get("duty", 0.0)))
-        self.starter_duty.append(float(starter.get("duty", 0.0)))
+        self.pump_duty.append(float(pump.get("cmd_duty", pump.get("duty", 0.0))))
+        self.starter_duty.append(float(starter.get("cmd_duty", starter.get("duty", 0.0))))
         self.pump_cur.append(float(pump.get("current_motor", 0.0)))
         self.starter_cur.append(float(starter.get("current_motor", 0.0)))
         self.psu_v.append(pv)
@@ -661,8 +670,8 @@ class MainWindow(QWidget):
         self._redraw(force_autoscale=False)
 
     def on_status(self, st: dict):
-        if st.get("ready"):
-            self.lbl_log.setText(f"log: {st.get('log_path', '-')}")
+        if st.get("ready") or st.get("reset_plot"):
+            self._clear_plot_buffers()
         if "log_path" in st and st.get("log_path"):
             self.lbl_log.setText(f"log: {st.get('log_path')}")
 
