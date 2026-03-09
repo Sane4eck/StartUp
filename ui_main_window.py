@@ -63,15 +63,10 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Dual VESC + PSU (Manual)")
 
-        # style (active + danger)
+        # style (active button only)
         self.setStyleSheet(self.styleSheet() + """
         QPushButton[active="true"] {
             background-color: #2d6cdf;
-            color: white;
-            font-weight: bold;
-        }
-        QPushButton[danger="true"] {
-            background-color: #c00000;
             color: white;
             font-weight: bold;
         }
@@ -81,11 +76,11 @@ class MainWindow(QWidget):
         self._any_connected = False
         self._last_autoscale_ts = 0.0  # autoscale ~1 Hz
 
-        # plot throttle (5 Hz redraw)
+        # plot throttle (10 Hz redraw)
         self._plot_dirty = False
         self._plot_timer = QTimer(self)
         self._plot_timer.timeout.connect(self._redraw_if_dirty)
-        self._plot_timer.start(200)
+        self._plot_timer.start(100)
 
         # worker thread
         self.worker_thread = QThread(self)
@@ -130,12 +125,12 @@ class MainWindow(QWidget):
 
         self.worker_thread.start()
 
-        # ports timer (тільки якщо Auto ports = ON)
+        # ports timer (only if Auto ports = ON)
         self.port_timer = QTimer(self)
         self.port_timer.timeout.connect(lambda: self.refresh_ports(force=False))
         self.port_timer.start(1500)
 
-        # buffers
+        # buffers (keep all, even if not plotted)
         self.t = []
         self.pump_rpm = []
         self.starter_rpm = []
@@ -152,38 +147,25 @@ class MainWindow(QWidget):
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         fig = self.canvas.figure
 
-        self.ax = fig.add_subplot(211)
-        self.ax_psu = fig.add_subplot(212)
+        # Starter-only plot (RPM + Duty + Current). PSU/valve plot removed.
+        self.ax = fig.add_subplot(111)
 
-        (self.l_pump_rpm,) = self.ax.plot([], [], label="Pump RPM", color="red")
         (self.l_starter_rpm,) = self.ax.plot([], [], label="Starter RPM", color="blue")
         self.ax.set_ylabel("RPM")
+        self.ax.set_xlabel("t (s)")
         self.ax.grid(True)
         self.ax.legend(loc="upper left")
 
         self.ax_duty = self.ax.twinx()
-        (self.l_pump_duty,) = self.ax_duty.plot([], [], linestyle="--", label="Pump Duty", color="red")
         (self.l_starter_duty,) = self.ax_duty.plot([], [], linestyle="--", label="Starter Duty", color="blue")
         self.ax_duty.set_ylabel("Duty")
         self.ax_duty.legend(loc="upper center")
 
         self.ax_cur = self.ax.twinx()
         self.ax_cur.spines["right"].set_position(("outward", 55))
-        (self.l_pump_cur,) = self.ax_cur.plot([], [], linestyle=":", label="Pump Current", color="red")
         (self.l_starter_cur,) = self.ax_cur.plot([], [], linestyle=":", label="Starter Current", color="blue")
         self.ax_cur.set_ylabel("Current (A)")
         self.ax_cur.legend(loc="upper right")
-
-        (self.l_psu_v,) = self.ax_psu.plot([], [], label="PSU Vout", color="green")
-        self.ax_psu.set_ylabel("V")
-        self.ax_psu.set_xlabel("t (s)")
-        self.ax_psu.grid(True)
-        self.ax_psu.legend(loc="upper left")
-
-        self.ax_psu_i = self.ax_psu.twinx()
-        (self.l_psu_i,) = self.ax_psu_i.plot([], [], linestyle="--", label="PSU Iout", color="green")
-        self.ax_psu_i.set_ylabel("A")
-        self.ax_psu_i.legend(loc="upper right")
 
         fig.tight_layout()
 
@@ -266,8 +248,6 @@ class MainWindow(QWidget):
         row2.addWidget(btn_set_r)
 
         btn_stop = QPushButton("Stop")
-        btn_stop.setProperty("danger", False)
-        self._apply_style(btn_stop)
         row2.addWidget(btn_stop)
 
         prof_path = None
@@ -312,13 +292,10 @@ class MainWindow(QWidget):
         self.in_cool_duty.setFixedWidth(80)
         self.btn_update = QPushButton("Update")
         self.btn_stop_all = QPushButton("Stop All")
-        self.btn_stop_all.setProperty("danger", True)
-        self._apply_style(self.btn_stop_all)
 
-        # NEW ports controls
         self.btn_refresh_ports = QPushButton("Refresh ports")
         self.chk_auto_ports = QCheckBox("Auto ports")
-        self.chk_auto_ports.setChecked(False)  # за замовчуванням вимкнено
+        self.chk_auto_ports.setChecked(False)
 
         row.addWidget(self.btn_ready)
         row.addWidget(self.btn_run)
@@ -379,13 +356,9 @@ class MainWindow(QWidget):
         self.btn_psu_set = QPushButton("Set V/I")
         self.btn_psu_on = QPushButton("Output ON")
         self.btn_psu_off = QPushButton("Output OFF")
-        self.btn_psu_off.setProperty("danger", False)
-        self._apply_style(self.btn_psu_off)
 
         self.btn_valve_on = QPushButton("On Valve")
         self.btn_valve_off = QPushButton("Off Valve")
-        self.btn_valve_off.setProperty("danger", False)
-        self._apply_style(self.btn_valve_off)
 
         r2.addWidget(QLabel("V:"))
         r2.addWidget(self.in_psu_v)
@@ -507,7 +480,6 @@ class MainWindow(QWidget):
     def _start_pump_profile(self):
         path = self.in_pump_prof_path.text().strip()
         self.sig_pump_profile_start.emit(path)
-        # active highlight робиться по статусу pump_profile.active
 
     # ---- ports refresh (manual / auto)
     def refresh_ports(self, force: bool = False):
@@ -515,7 +487,6 @@ class MainWindow(QWidget):
         if not force and not auto:
             return
 
-        # авто-скан не робимо під час підключення (щоб не фрізило)
         if not force and self._any_connected:
             return
 
@@ -527,7 +498,6 @@ class MainWindow(QWidget):
             for p in new_ports:
                 if p not in existing:
                     cb.addItem(p)
-            # не видаляємо старі елементи — щоб підключені порти “не пропадали”
             if current:
                 cb.setCurrentText(current)
 
@@ -620,7 +590,6 @@ class MainWindow(QWidget):
 
     # ---------------- plot update
     def on_sample(self, s: dict):
-        # IMPORTANT: тут тепер оновлюються числові лейбли (інакше завжди 0)
         t = float(s.get("t", 0.0))
         stage = s.get("stage", "-")
         self.lbl_stage.setText(f"stage: {stage}")
@@ -667,19 +636,14 @@ class MainWindow(QWidget):
             self.canvas.draw_idle()
             return
 
-        self.l_pump_rpm.set_data(self.t, self.pump_rpm)
+        # Starter-only plot
         self.l_starter_rpm.set_data(self.t, self.starter_rpm)
-        self.l_pump_duty.set_data(self.t, self.pump_duty)
         self.l_starter_duty.set_data(self.t, self.starter_duty)
-        self.l_pump_cur.set_data(self.t, self.pump_cur)
         self.l_starter_cur.set_data(self.t, self.starter_cur)
-        self.l_psu_v.set_data(self.t, self.psu_v)
-        self.l_psu_i.set_data(self.t, self.psu_i)
 
         tmax = self.t[-1]
         tmin = max(0.0, tmax - 30.0)
         self.ax.set_xlim(tmin, tmax)
-        self.ax_psu.set_xlim(tmin, tmax)
 
         now = time.time()
         if force_autoscale or (now - self._last_autoscale_ts >= 1.0):
@@ -687,8 +651,6 @@ class MainWindow(QWidget):
             self.ax.relim(); self.ax.autoscale_view(True, True, True)
             self.ax_duty.relim(); self.ax_duty.autoscale_view(True, True, True)
             self.ax_cur.relim(); self.ax_cur.autoscale_view(True, True, True)
-            self.ax_psu.relim(); self.ax_psu.autoscale_view(True, True, True)
-            self.ax_psu_i.relim(); self.ax_psu_i.autoscale_view(True, True, True)
 
         self.canvas.draw_idle()
 
