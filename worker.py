@@ -19,7 +19,7 @@ from cyclogram_startup import build_startup_fsm, StartupConfig, build_cooling_fs
 
 
 PUMP_PROFILE_XLSX = "_Cyclogram_Pump.xlsx"
-STARTER_PROFILE_XLSX = "_Cyclogram_Starter.xlsx"
+# STARTER_PROFILE_XLSX = "_Cyclogram_Starter.xlsx"
 
 
 def _clamp01(x: float) -> float:
@@ -499,11 +499,11 @@ class ControllerWorker(QObject):
                 self._pump_profile = load_pump_profile_xlsx(p_path, sheet_name=None)
                 self._pump_profile_mtime = p_mtime
 
-            s_path = os.path.join(base, STARTER_PROFILE_XLSX)
-            s_mtime = os.path.getmtime(s_path)
-            if (self._starter_profile is None) or (self._starter_profile_mtime != s_mtime):
-                self._starter_profile = load_pump_profile_xlsx(s_path, sheet_name=None)
-                self._starter_profile_mtime = s_mtime
+            # s_path = os.path.join(base, STARTER_PROFILE_XLSX)
+            # s_mtime = os.path.getmtime(s_path)
+            # if (self._starter_profile is None) or (self._starter_profile_mtime != s_mtime):
+            #     self._starter_profile = load_pump_profile_xlsx(s_path, sheet_name=None)
+            #     self._starter_profile_mtime = s_mtime
 
             return True
         except Exception as e:
