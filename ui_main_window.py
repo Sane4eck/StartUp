@@ -1,9 +1,11 @@
 # ui_main_window.py
 from __future__ import annotations
 
+import base64
 import time
 
 from PyQt5.QtCore import QTimer, pyqtSignal, Qt, QThread, QMetaObject
+from PyQt5.QtGui import QPixmap, QIcon
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QLineEdit,
     QGroupBox, QSizePolicy, QFileDialog, QCheckBox
@@ -11,6 +13,7 @@ from PyQt5.QtWidgets import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as Canvas
 from matplotlib.figure import Figure
 
+from icon_exe.icon_bese64 import icon_base64
 from worker import ControllerWorker
 
 
@@ -61,7 +64,12 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dual VESC + PSU (Manual)")
+        icon_data = base64.b64decode(icon_base64)
+        pixmap = QPixmap()
+        pixmap.loadFromData(icon_data)
+        self.setWindowIcon(QIcon(pixmap))
+
+        self.setWindowTitle("Start-up")
 
         # style (active button only)
         self.setStyleSheet(self.styleSheet() + """
