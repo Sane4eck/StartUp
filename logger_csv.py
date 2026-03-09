@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import csv
 import os
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-# ТІЛЬКИ ці поля беремо з VESC GetValues (raw)
+
+# лишаємо ці поля з VESC GetValues (raw)
 VESC_KEEP_KEYS: List[str] = [
     "temp_fet",
     "avg_motor_current",
@@ -26,78 +26,44 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
-@dataclass
-class CsvConfig:
-    folder: str = "logs"
-    prefix: str = "session"
-    flush_period_s: float = 1.0  # як часто робимо flush()
-
-
 class CSVLogger:
-    """
-    Відповідає ТІЛЬКИ за файл і формат CSV.
-    Worker передає: t/stage, targets, vesc values, psu dict.
-    """
-
-    def __init__(self, cfg: Optional[CsvConfig] = None):
-        self.cfg = cfg or CsvConfig()
+    def __init__(self):
+        self.f = None
+        self.w: Optional[csv.writer] = None
         self.path: Optional[str] = None
-        self._f = None
-        self._w: Optional[csv.writer] = None
         self.header: List[str] = []
-        self._next_flush_t: float = 0.0
 
-    def start(self, prefix: Optional[str] = None) -> str:
-        os.makedirs(self.cfg.folder, exist_ok=True)
+    def start(self, folder: str = "logs", prefix: str = "session") -> str:
+        os.makedirs(folder, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = os.path.join(folder, f"{prefix}_{ts}.csv")
 
-        pref = (prefix or self.cfg.prefix).strip() or self.cfg.prefix
-        self.path = os.path.join(self.cfg.folder, f"{pref}_{ts}.csv")
-
-        # line-buffered
-        self._f = open(self.path, "w", newline="", encoding="utf-8", buffering=1)
-        self._w = csv.writer(self._f)
+        self.f = open(self.path, "w", newline="", encoding="utf-8", buffering=1)
+        self.w = csv.writer(self.f)
 
         self.header = self.build_header()
-        self._w.writerow(self.header)
-        self.flush(force=True)
-
+        self.w.writerow(self.header)
+        self.flush()
         return self.path
 
     def stop(self) -> None:
         try:
-            self.flush(force=True)
+            self.flush()
+            if self.f:
+                self.f.close()
         finally:
-            try:
-                if self._f:
-                    self._f.close()
-            except Exception:
-                pass
-            self._f = None
-            self._w = None
+            self.f = None
+            self.w = None
             self.path = None
             self.header = []
-            self._next_flush_t = 0.0
 
-    def flush(self, force: bool = False, now: Optional[float] = None) -> None:
-        if not self._f:
-            return
-        if force:
+    def flush(self) -> None:
+        if self.f:
             try:
-                self._f.flush()
+                self.f.flush()
             except Exception:
                 pass
-            return
-        if now is None:
-            return
-        if now >= self._next_flush_t:
-            try:
-                self._f.flush()
-            except Exception:
-                pass
-            self._next_flush_t = now + float(self.cfg.flush_period_s)
 
-    # ---------- format ----------
     def build_header(self) -> List[str]:
         return [
             "t", "stage",
@@ -114,43 +80,44 @@ class CSVLogger:
             "starter_rpm_mech",
             *[f"starter_{k}" for k in VESC_KEEP_KEYS],
 
-            # PSU (як було)
+            # PSU
             "psu_v_set", "psu_i_set", "psu_v_out", "psu_i_out", "psu_p_out",
         ]
 
-    def write(
+    def build_row(
         self,
-        *,
-        now: float,
         t: float,
         stage: str,
         pump_target: Dict[str, Any],
         starter_target: Dict[str, Any],
         pole_pairs_pump: int,
         pole_pairs_starter: int,
-        pump_vals: Any,    # VESCValues
-        starter_vals: Any, # VESCValues
+        pump_vals: Any,        # VESCValues (має rpm_mech + raw)
+        starter_vals: Any,     # VESCValues (має rpm_mech + raw)
         psu: Dict[str, Any],
-    ) -> None:
-        if not self._w:
-            return
-
-        row_map: Dict[str, Any] = {
+    ) -> List[Any]:
+        row: Dict[str, Any] = {
             "t": t,
             "stage": stage,
-            **self._cmd_cols(pump_target, pole_pairs_pump, "pump_"),
-            **self._cmd_cols(starter_target, pole_pairs_starter, "starter_"),
-            **self._vesc_selected(pump_vals, "pump_"),
-            **self._vesc_selected(starter_vals, "starter_"),
-            "psu_v_set": float(psu.get("v_set", 0.0)) if psu else 0.0,
-            "psu_i_set": float(psu.get("i_set", 0.0)) if psu else 0.0,
-            "psu_v_out": float(psu.get("v_out", 0.0)) if psu else 0.0,
-            "psu_i_out": float(psu.get("i_out", 0.0)) if psu else 0.0,
-            "psu_p_out": float(psu.get("p_out", 0.0)) if psu else 0.0,
         }
 
-        self._w.writerow([row_map.get(col, "") for col in self.header])
-        self.flush(now=now)
+        row.update(self._cmd_cols(pump_target, pole_pairs_pump, "pump_"))
+        row.update(self._cmd_cols(starter_target, pole_pairs_starter, "starter_"))
+
+        row.update(self._vesc_selected(pump_vals, "pump_"))
+        row.update(self._vesc_selected(starter_vals, "starter_"))
+
+        row["psu_v_set"] = float(psu.get("v_set", 0.0)) if psu else 0.0
+        row["psu_i_set"] = float(psu.get("i_set", 0.0)) if psu else 0.0
+        row["psu_v_out"] = float(psu.get("v_out", 0.0)) if psu else 0.0
+        row["psu_i_out"] = float(psu.get("i_out", 0.0)) if psu else 0.0
+        row["psu_p_out"] = float(psu.get("p_out", 0.0)) if psu else 0.0
+
+        return [row.get(col, "") for col in self.header]
+
+    def write_row(self, row: List[Any]) -> None:
+        if self.w:
+            self.w.writerow(row)
 
     def _cmd_cols(self, target: Dict[str, Any], pole_pairs: int, prefix: str) -> Dict[str, Any]:
         mode = str(target.get("mode", "duty"))
