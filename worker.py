@@ -525,15 +525,16 @@ class ControllerWorker(QObject):
             now = time.time()
             t = now - self._t0
 
-            # read vesc
+            # ---- read VESC (feedback)
             pv = self._vesc_read(self.pump, self.pole_pairs_pump, label="pump")
             if pv is not None:
                 self._last_pump = pv
+
             sv = self._vesc_read(self.starter, self.pole_pairs_starter, label="starter")
             if sv is not None:
                 self._last_starter = sv
 
-            # read psu (2 Hz)
+            # ---- read PSU (2 Hz)
             if self.psu.is_connected and now >= self._psu_next_read:
                 try:
                     self._last_psu = self.psu.read() or {}
@@ -543,37 +544,53 @@ class ControllerWorker(QObject):
                     self._emit_connected()
                 self._psu_next_read = now + 0.5
 
-            # Manual pump profile takes control ONLY if no FSM
+            # ---- Manual pump profile takes control ONLY if no FSM
             if self._fsm is None and self._pump_prof_active and self._pump_prof is not None:
                 elapsed = now - self._pump_prof_t0
                 end_t = self._pump_prof.end_time
+
                 if end_t > 0.0 and elapsed >= end_t:
                     self._stop_pump_profile_internal()
                     self.pump_target = {"mode": "rpm", "value": 0.0}
+
                 if self._pump_prof_active:
                     rpm_cmd = interp_profile(self._pump_prof, elapsed)
                     self.pump_target = {"mode": "rpm", "value": float(rpm_cmd)}
                     self.stage = "PumpProfile"
 
-            # Run/Cooling cyclogram
+            # ---- Run/Cooling cyclogram (FSM)
             if self._fsm is not None:
                 inp = self._make_inputs(now)
-                targets = self._fsm.tick(inp)
-                self.stage = self._fsm.state
 
-                if self._fsm.state != self._fsm_prev_state:
-                    self._fsm_prev_state = self._fsm.state
+                old_state = self._fsm_prev_state or self._fsm.state
+
+                targets = self._fsm.tick(inp)
+                new_state = self._fsm.state
+                self.stage = new_state
+
+                # Fault message on transition
+                if new_state != old_state:
                     reason = targets.meta.get("transition_reason")
-                    if self._fsm.state == "Fault" and reason:
+                    if new_state == "Fault" and reason:
                         self.error.emit(reason)
 
-                # In Running: pump is manual (do NOT overwrite)
-                if self._fsm.state != "Running":
+                # apply pump:
+                # - always when not Running
+                # - OR exactly once on entering Running (for freeze rpm)
+                apply_pump = (new_state != "Running")
+                if (not apply_pump) and (old_state != "Running") and (new_state == "Running"):
+                    if targets.meta.get("apply_pump_once_on_running_entry"):
+                        apply_pump = True
+
+                if apply_pump:
                     self.pump_target = targets.pump
+
                 self.starter_target = targets.starter
                 self._set_psu_target(targets.psu["v"], targets.psu["i"], targets.psu["out"])
 
-            # Valve macro overrides PSU (only if active and no cyclogram)
+                self._fsm_prev_state = new_state
+
+            # ---- Valve macro overrides PSU (only if active and no cyclogram)
             if self._fsm is None and self._valve_macro_active:
                 elapsed = now - self._valve_macro_t0
                 if elapsed < self._valve_boost_s:
@@ -581,7 +598,7 @@ class ControllerWorker(QObject):
                 else:
                     self._set_psu_target(self._valve_hold_v, self._valve_hold_i, True)
 
-            # PSU apply only changed
+            # ---- PSU apply only changed
             if self.psu.is_connected and self._psu_dirty and now >= self._psu_next_cmd:
                 try:
                     v = self.psu_target["v"]
@@ -604,11 +621,11 @@ class ControllerWorker(QObject):
                     self._disconnect_psu()
                     self._emit_connected()
 
-            # send targets + request values
+            # ---- send targets + request values
             self._vesc_send_and_request(self.pump, self.pump_target, self.pole_pairs_pump, "pump")
             self._vesc_send_and_request(self.starter, self.starter_target, self.pole_pairs_starter, "starter")
 
-            # sample
+            # ---- sample to UI
             sample = {
                 "t": t,
                 "stage": self.stage,
@@ -635,7 +652,7 @@ class ControllerWorker(QObject):
                 self.sample.emit(sample)
                 self._next_ui_emit = now + self._ui_dt
 
-            # CSV 5 Hz
+            # ---- CSV 5 Hz
             if self.logging_on and self.logger.path and (now >= self._next_log_write):
                 row = [
                     t, self.stage,
