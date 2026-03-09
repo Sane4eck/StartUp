@@ -654,16 +654,18 @@ class ControllerWorker(QObject):
 
             # ---- CSV 5 Hz
             if self.logging_on and self.logger.path and (now >= self._next_log_write):
-                row = [
-                    t, self.stage,
-                    self._last_pump.rpm_mech, self._last_pump.duty, self._last_pump.current_motor,
-                    self._last_starter.rpm_mech, self._last_starter.duty, self._last_starter.current_motor,
-                    float(self._last_psu.get("v_set", 0.0)) if self._last_psu else 0.0,
-                    float(self._last_psu.get("i_set", 0.0)) if self._last_psu else 0.0,
-                    float(self._last_psu.get("v_out", 0.0)) if self._last_psu else 0.0,
-                    float(self._last_psu.get("i_out", 0.0)) if self._last_psu else 0.0,
-                    float(self._last_psu.get("p_out", 0.0)) if self._last_psu else 0.0,
-                ]
+                row = self.logger.build_row(
+                    t=t,
+                    stage=self.stage,
+                    pump_target=self.pump_target,
+                    starter_target=self.starter_target,
+                    pole_pairs_pump=self.pole_pairs_pump,
+                    pole_pairs_starter=self.pole_pairs_starter,
+                    pump_vals=self._last_pump,
+                    starter_vals=self._last_starter,
+                    psu=self._last_psu,
+                )
+                self.logger.write_row(row)
                 try:
                     self.logger.write_row(row)
                     self._next_log_write = now + self._log_dt
