@@ -150,20 +150,20 @@ class MainWindow(QWidget):
         # Starter-only plot (RPM + Duty + Current). PSU/valve plot removed.
         self.ax = fig.add_subplot(111)
 
-        (self.l_starter_rpm,) = self.ax.plot([], [], label="Starter RPM", color="blue")
+        (self.l_starter_rpm,) = self.ax.plot([], [], label="Starter RPM", color="black")
         self.ax.set_ylabel("RPM")
         self.ax.set_xlabel("t (s)")
         self.ax.grid(True)
         self.ax.legend(loc="upper left")
 
         self.ax_duty = self.ax.twinx()
-        (self.l_starter_duty,) = self.ax_duty.plot([], [], linestyle="--", label="Starter Duty", color="blue")
+        (self.l_starter_duty,) = self.ax_duty.plot([], [], linestyle="--", label="Starter Duty", color="green")
         self.ax_duty.set_ylabel("Duty")
         self.ax_duty.legend(loc="upper center")
 
         self.ax_cur = self.ax.twinx()
         self.ax_cur.spines["right"].set_position(("outward", 55))
-        (self.l_starter_cur,) = self.ax_cur.plot([], [], linestyle=":", label="Starter Current", color="blue")
+        (self.l_starter_cur,) = self.ax_cur.plot([], [], linestyle=":", label="Starter Current", color="red")
         self.ax_cur.set_ylabel("Current (A)")
         self.ax_cur.legend(loc="upper right")
 
