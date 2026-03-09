@@ -6,13 +6,17 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import serial
+from serial import SerialException
+
 from pyvesc import encode, encode_request, decode
-from pyvesc.VESC.messages import SetDutyCycle, SetRPM, GetValues
+from pyvesc.VESC.messages import GetValues, SetDutyCycle, SetRPM
 
 
 def _msg_to_dict(msg: Any) -> Dict[str, Any]:
     """
-    Витягує всі JSON-сумісні поля з GetValues.
+    Витягує ВСІ JSON-сумісні поля з GetValues:
+      - скаляри int/float/bool/str/None
+      - списки/кортежі з чисел
     """
     out: Dict[str, Any] = {}
     for name in dir(msg):
@@ -24,10 +28,15 @@ def _msg_to_dict(msg: Any) -> Dict[str, Any]:
             continue
         if callable(val):
             continue
-        if isinstance(val, (int, float, bool, str)) or val is None:
+
+        if val is None or isinstance(val, (int, float, bool, str)):
             out[name] = val
-        elif isinstance(val, (list, tuple)) and all(isinstance(x, (int, float, bool)) for x in val):
+            continue
+
+        if isinstance(val, (list, tuple)) and all(isinstance(x, (int, float, bool)) for x in val):
             out[name] = list(val)
+            continue
+
     return out
 
 
@@ -36,16 +45,17 @@ class VESCValues:
     rpm_mech: float = 0.0
     duty: float = 0.0
     current_motor: float = 0.0
-    raw: Dict[str, Any] = field(default_factory=dict)  # всі поля GetValues
+    raw: Dict[str, Any] = field(default_factory=dict)
 
 
 class VESCDevice:
     def __init__(self, baudrate: int = 115200, timeout: float = 0.01):
         self.baudrate = int(baudrate)
         self.timeout = float(timeout)
+
         self.ser: Optional[serial.Serial] = None
         self.port: Optional[str] = None
-        self._rxbuf = b""
+        self._rxbuf: bytes = b""
 
     @property
     def is_connected(self) -> bool:
@@ -53,7 +63,12 @@ class VESCDevice:
 
     def connect(self, port: str) -> None:
         self.disconnect()
-        self.ser = serial.Serial(port=port, baudrate=self.baudrate, timeout=self.timeout, write_timeout=0.2)
+        self.ser = serial.Serial(
+            port=port,
+            baudrate=self.baudrate,
+            timeout=self.timeout,
+            write_timeout=0.2,
+        )
         self.port = port
         try:
             self.ser.reset_input_buffer()
@@ -101,16 +116,21 @@ class VESCDevice:
             return None
 
         pp = max(1, int(pole_pairs))
-        deadline = time.time() + float(timeout_s)
+        deadline = time.monotonic() + float(timeout_s)
 
-        while time.time() < deadline:
-            chunk = self.ser.read(256)
+        while time.monotonic() < deadline:
+            try:
+                chunk = self.ser.read(256)
+            except (SerialException, OSError):
+                raise
+
             if chunk:
                 self._rxbuf += chunk
 
             try:
                 msg, consumed = decode(self._rxbuf)
             except Exception:
+                # якщо буфер зламався — скидаємо
                 self._rxbuf = b""
                 msg, consumed = None, 0
 
@@ -119,8 +139,7 @@ class VESCDevice:
 
             if isinstance(msg, GetValues):
                 raw = _msg_to_dict(msg)
-
-                erpm = float(raw.get("rpm", 0.0) or 0.0)  # GetValues.rpm = ERPM
+                erpm = float(raw.get("rpm", 0.0) or 0.0)
                 duty = float(raw.get("duty_cycle_now", 0.0) or 0.0)
                 current = float(raw.get("avg_motor_current", 0.0) or 0.0)
 
