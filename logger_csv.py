@@ -7,26 +7,26 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
-# лишаємо ці поля з VESC GetValues (raw)
-VESC_KEEP_KEYS: List[str] = [
-    "temp_fet",
-    "avg_motor_current",
-    "avg_input_current",
-    "duty_cycle_now",
-    "rpm",
-    "v_in",
-    "watt_hours",
-    "watt_hours_charged",
-    "amp_hours",
-    "amp_hours_charged",
-]
-
-
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
+def _f(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
 class CSVLogger:
+    """
+    Формат CSV:
+      t, stage,
+      [pump fields...],
+      [starter fields...],
+      [psu fields...]
+    """
+
     def __init__(self):
         self.f = None
         self.w: Optional[csv.writer] = None
@@ -64,23 +64,32 @@ class CSVLogger:
             except Exception:
                 pass
 
+    # ---------------- schema
     def build_header(self) -> List[str]:
         return [
             "t", "stage",
 
-            # what you set (commands)
-            "pump_cmd_mode", "pump_cmd_value", "pump_cmd_rpm", "pump_cmd_duty", "pump_cmd_erpm",
-            "starter_cmd_mode", "starter_cmd_value", "starter_cmd_rpm", "starter_cmd_duty", "starter_cmd_erpm",
+            # ---- PUMP (pmp_)
+            "pmp_rpm_cmd", "pmp_erpm_cmd", "pmp_duty_cmd",
 
-            # selected VESC data (pump)
-            "pump_rpm_mech",
-            *[f"pump_{k}" for k in VESC_KEEP_KEYS],
+            "pmp_rpm_get", "pmp_erpm_get", "pmp_duty_get",
+            "pmp_current_get", "pmp_bat_current", "pmp_v_in_get",
 
-            # selected VESC data (starter)
-            "starter_rpm_mech",
-            *[f"starter_{k}" for k in VESC_KEEP_KEYS],
+            "pmp_raw_amp_hours", "pmp_raw_amp_hours_charged",
+            "pmp_raw_watt_hours", "pmp_raw_watt_hours_charged",
+            "pmp_raw_temp_fet", "pmp_raw_temp_motor",
 
-            # PSU
+            # ---- STARTER (strtr_)
+            "strtr_rpm_cmd", "strtr_erpm_cmd", "strtr_duty_cmd",
+
+            "strtr_rpm_get", "strtr_erpm_get", "strtr_duty_get",
+            "strtr_current_get", "strtr_bat_current", "strtr_v_in_get",
+
+            "strtr_raw_amp_hours", "strtr_raw_amp_hours_charged",
+            "strtr_raw_watt_hours", "strtr_raw_watt_hours_charged",
+            "strtr_raw_temp_fet", "strtr_raw_temp_motor",
+
+            # ---- PSU (як є)
             "psu_v_set", "psu_i_set", "psu_v_out", "psu_i_out", "psu_p_out",
         ]
 
@@ -92,26 +101,25 @@ class CSVLogger:
         starter_target: Dict[str, Any],
         pole_pairs_pump: int,
         pole_pairs_starter: int,
-        pump_vals: Any,        # VESCValues (має rpm_mech + raw)
-        starter_vals: Any,     # VESCValues (має rpm_mech + raw)
+        pump_vals: Any,     # VESCValues: rpm_mech, duty, current_motor, raw(dict)
+        starter_vals: Any,  # VESCValues
         psu: Dict[str, Any],
     ) -> List[Any]:
-        row: Dict[str, Any] = {
-            "t": t,
-            "stage": stage,
-        }
+        row: Dict[str, Any] = {"t": t, "stage": stage}
 
-        row.update(self._cmd_cols(pump_target, pole_pairs_pump, "pump_"))
-        row.update(self._cmd_cols(starter_target, pole_pairs_starter, "starter_"))
+        row.update(self._cmd_cols(pump_target, pole_pairs_pump, "pmp_"))
+        row.update(self._get_cols(pump_vals, pole_pairs_pump, "pmp_"))
+        row.update(self._raw_cols(pump_vals, "pmp_"))
 
-        row.update(self._vesc_selected(pump_vals, "pump_"))
-        row.update(self._vesc_selected(starter_vals, "starter_"))
+        row.update(self._cmd_cols(starter_target, pole_pairs_starter, "strtr_"))
+        row.update(self._get_cols(starter_vals, pole_pairs_starter, "strtr_"))
+        row.update(self._raw_cols(starter_vals, "strtr_"))
 
-        row["psu_v_set"] = float(psu.get("v_set", 0.0)) if psu else 0.0
-        row["psu_i_set"] = float(psu.get("i_set", 0.0)) if psu else 0.0
-        row["psu_v_out"] = float(psu.get("v_out", 0.0)) if psu else 0.0
-        row["psu_i_out"] = float(psu.get("i_out", 0.0)) if psu else 0.0
-        row["psu_p_out"] = float(psu.get("p_out", 0.0)) if psu else 0.0
+        row["psu_v_set"] = _f(psu.get("v_set", 0.0)) if psu else 0.0
+        row["psu_i_set"] = _f(psu.get("i_set", 0.0)) if psu else 0.0
+        row["psu_v_out"] = _f(psu.get("v_out", 0.0)) if psu else 0.0
+        row["psu_i_out"] = _f(psu.get("i_out", 0.0)) if psu else 0.0
+        row["psu_p_out"] = _f(psu.get("p_out", 0.0)) if psu else 0.0
 
         return [row.get(col, "") for col in self.header]
 
@@ -119,30 +127,60 @@ class CSVLogger:
         if self.w:
             self.w.writerow(row)
 
+    # ---------------- internals
     def _cmd_cols(self, target: Dict[str, Any], pole_pairs: int, prefix: str) -> Dict[str, Any]:
+        """
+        Пишемо тільки те, чим реально керуєш зараз.
+        Інше залишаємо пустим.
+        """
         mode = str(target.get("mode", "duty"))
-        val = float(target.get("value", 0.0))
+        val = _f(target.get("value", 0.0))
         pp = max(1, int(pole_pairs))
 
         out = {
-            f"{prefix}cmd_mode": mode,
-            f"{prefix}cmd_value": val,
-            f"{prefix}cmd_rpm": "",
-            f"{prefix}cmd_duty": "",
-            f"{prefix}cmd_erpm": "",
+            f"{prefix}rpm_cmd": "",
+            f"{prefix}erpm_cmd": "",
+            f"{prefix}duty_cmd": "",
         }
+
         if mode == "rpm":
-            out[f"{prefix}cmd_rpm"] = val
-            out[f"{prefix}cmd_erpm"] = val * pp
+            out[f"{prefix}rpm_cmd"] = val
+            out[f"{prefix}erpm_cmd"] = val * pp
         else:
-            out[f"{prefix}cmd_duty"] = _clamp01(val)
+            out[f"{prefix}duty_cmd"] = _clamp01(val)
+
         return out
 
-    def _vesc_selected(self, vesc_vals: Any, prefix: str) -> Dict[str, Any]:
-        rpm_mech = float(getattr(vesc_vals, "rpm_mech", 0.0) or 0.0)
+    def _get_cols(self, vesc_vals: Any, pole_pairs: int, prefix: str) -> Dict[str, Any]:
         raw = getattr(vesc_vals, "raw", {}) or {}
+        pp = max(1, int(pole_pairs))
 
-        out: Dict[str, Any] = {f"{prefix}rpm_mech": rpm_mech}
-        for k in VESC_KEEP_KEYS:
-            out[f"{prefix}{k}"] = raw.get(k, "")
-        return out
+        erpm = raw.get("rpm", None)
+        duty = raw.get("duty_cycle_now", None)
+        cur_m = raw.get("avg_motor_current", None)
+        cur_b = raw.get("avg_input_current", None)
+        v_in = raw.get("v_in", None)
+
+        # rpm_get: або з rpm_mech (вже пораховано), або з erpm/pp
+        rpm_mech_attr = getattr(vesc_vals, "rpm_mech", None)
+        rpm_get = _f(rpm_mech_attr) if rpm_mech_attr is not None else (_f(erpm) / pp)
+
+        return {
+            f"{prefix}rpm_get": rpm_get,
+            f"{prefix}erpm_get": _f(erpm, 0.0),
+            f"{prefix}duty_get": _f(duty, 0.0),
+            f"{prefix}current_get": _f(cur_m, 0.0),
+            f"{prefix}bat_current": _f(cur_b, 0.0),
+            f"{prefix}v_in_get": _f(v_in, 0.0),
+        }
+
+    def _raw_cols(self, vesc_vals: Any, prefix: str) -> Dict[str, Any]:
+        raw = getattr(vesc_vals, "raw", {}) or {}
+        return {
+            f"{prefix}raw_amp_hours": _f(raw.get("amp_hours", 0.0)),
+            f"{prefix}raw_amp_hours_charged": _f(raw.get("amp_hours_charged", 0.0)),
+            f"{prefix}raw_watt_hours": _f(raw.get("watt_hours", 0.0)),
+            f"{prefix}raw_watt_hours_charged": _f(raw.get("watt_hours_charged", 0.0)),
+            f"{prefix}raw_temp_fet": _f(raw.get("temp_fet", 0.0)),
+            f"{prefix}raw_temp_motor": _f(raw.get("temp_motor", 0.0)),
+        }
