@@ -661,6 +661,7 @@ class ControllerWorker(QObject):
                 self._next_ui_emit = now + self._ui_dt
 
             # ---- CSV 5 Hz (ОДИН запис)
+            # CSV 5 Hz
             if self.logging_on and self.logger.path and (now >= self._next_log_write):
                 try:
                     row = self.logger.build_row(
@@ -675,8 +676,8 @@ class ControllerWorker(QObject):
                         psu=self._last_psu,
                     )
                     self.logger.write_row(row)
-                    self._next_log_write = now + self._log_dt
 
+                    self._next_log_write = now + self._log_dt
                     if now >= self._next_flush_t:
                         self.logger.flush()
                         self._next_flush_t = now + 1.0
