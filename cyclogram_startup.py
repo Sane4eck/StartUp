@@ -95,9 +95,10 @@ class StartupConfig:
         (1300.0, 0.10),
         (2000.0, 0.12),
         (3000.0, 0.14),
-        (5000.0, 0.15),
+        (4000.0, 0.15),
+        (5000.0, 0.16),
     ])
-    starter_step_hold_s: float = 1.0
+    starter_step_hold_s: float = 0.5
 
     # --- Starter -> FuelRamp (by starter RPM)
     to_fuelramp_starter_rpm: float = 1000.0
