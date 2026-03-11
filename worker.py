@@ -19,6 +19,7 @@ from cyclogram_startup import build_startup_fsm, StartupConfig, build_cooling_fs
 
 
 PUMP_PROFILE_XLSX = "_Cyclogram_Pump.xlsx"
+PUMP_PROFILE_XLSX = "_Cyclogram_Pump_test.xlsx"
 # STARTER_PROFILE_XLSX = "_Cyclogram_Starter.xlsx"
 
 
